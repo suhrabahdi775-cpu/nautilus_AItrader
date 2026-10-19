@@ -1,13 +1,13 @@
-# NautilusTrader DeepSeek AI Trading Strategy
+# NautilusTrader AI Trading Strategy (Claude / DeepSeek / Kimi)
 
 ## v1.2.2 - Advanced AI-Powered Cryptocurrency Trading System
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![NautilusTrader](https://img.shields.io/badge/NautilusTrader-Latest-green.svg)](https://nautilustrader.io/)
-[![DeepSeek AI](https://img.shields.io/badge/DeepSeek-AI%20Powered-purple.svg)](https://www.deepseek.com/)
+[![Claude](https://img.shields.io/badge/Claude-AI%20Powered-purple.svg)](https://platform.claude.com/)
 [![License](https://img.shields.io/badge/license-Educational-orange.svg)](LICENSE)
 
-**Professional algorithmic trading system combining DeepSeek AI decision-making, advanced technical analysis, and institutional-grade risk management for automated BTC/USDT perpetual futures trading on Binance.**
+**Professional algorithmic trading system combining LLM decision-making (Anthropic Claude by default; DeepSeek / Kimi via any OpenAI-compatible API), advanced technical analysis, and institutional-grade risk management for automated BTC/USDT perpetual futures trading on Binance.**
 
 ---
 
@@ -31,18 +31,42 @@
 
 ---
 
+## LLM Decision Layer (Claude)
+
+The trade decision is produced by `utils/llm_client.py` (`LLMAnalyzer`), which is
+provider-agnostic:
+
+| Provider (`LLM_PROVIDER`) | Key variable | Default model | Notes |
+|---|---|---|---|
+| `anthropic` (default) | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` | Structured JSON output via the Messages API `output_config` schema - the signal is guaranteed to be schema-valid (`BUY/SELL/HOLD`, `HIGH/MEDIUM/LOW`, numeric SL/TP). Tune depth with `LLM_EFFORT` (low..max); Claude has no temperature parameter. |
+| `openai` | `LLM_API_KEY` (or legacy `DEEPSEEK_API_KEY`) | `deepseek-v4-pro` | Any OpenAI-compatible chat endpoint via `LLM_BASE_URL` (DeepSeek, Kimi/Moonshot, ...). |
+| `auto` | either | - | Picks `anthropic` when `ANTHROPIC_API_KEY` is set (or the key/model looks like Claude), else `openai`. |
+
+Every response is validated before it reaches the execution layer; anything
+invalid (unknown signal value, missing field, parse error, API error, refusal)
+becomes a conservative `HOLD` fallback. Set `TEST_MODE=true` (or `DRY_RUN=true`)
+to run the whole pipeline - including real Claude calls - in signal-only mode
+where **no orders are placed**; signals are appended to `logs/signal_log.jsonl`
+for `tools/score_signals.py`.
+
+Approximate Claude cost at the default 15-minute cadence (96 calls/day, ~4k
+input / ~0.3k output tokens per call): Sonnet 5.5 ≈ $1.1/day, Opus 5.5 ≈ $2.1/day,
+Haiku 5.5 ≈ $0.05/day.
+
+---
+
 ## Features
 
 ### Core Capabilities
 
-- **AI-Powered Decision Making**: DeepSeek AI analyzes market conditions and generates intelligent trading signals with confidence levels (HIGH/MEDIUM/LOW)
+- **AI-Powered Decision Making**: Claude (default) analyzes market conditions and returns a schema-validated JSON trading signal with confidence levels (HIGH/MEDIUM/LOW). Switch providers with `LLM_PROVIDER` (DeepSeek, Kimi K3 or any OpenAI-compatible endpoint)
 - **Comprehensive Technical Analysis**:
   - Moving Averages (SMA 5/20/50, EMA 12/26)
   - Momentum Indicators (RSI 14, MACD)
   - Volatility Bands (Bollinger 20, 2σ)
   - Support/Resistance Detection
   - Volume Analysis
-- **Sentiment Integration**: CryptoOracle API for real-time market sentiment analysis
+- **Sentiment Integration**: alternative.me Fear & Greed Index (free, no key) as the sentiment layer
 - **Intelligent Position Sizing**: Dynamic sizing based on AI confidence, trend strength, RSI extremes, and risk limits
 - **Event-Driven Architecture**: Built on NautilusTrader's professional framework for high-performance execution
 
@@ -353,20 +377,21 @@ BINANCE_API_KEY=your_binance_api_key_here
 BINANCE_API_SECRET=your_binance_api_secret_here
 
 # ========================================
-# AI SERVICE (LLM provider)
+# AI DECISION LAYER (LLM provider)
 # ========================================
-# Active provider via LLM_* (takes precedence over legacy DEEPSEEK_*).
-# Kimi K3 / Moonshot AI example (note: kimi-k3 requires temperature=1):
-LLM_API_KEY=your_llm_api_key_here
-LLM_MODEL=kimi-k3
-LLM_BASE_URL=https://api.moonshot.cn/v1
-LLM_TEMPERATURE=1.0
+# Claude (Anthropic) is the default decision engine.
+LLM_PROVIDER=anthropic              # anthropic | openai | auto
+ANTHROPIC_API_KEY=sk-ant-...        # https://platform.claude.com/
+LLM_MODEL=claude-sonnet-5-5         # claude-opus-5-5 for max quality, claude-haiku-5-5 for min cost
+LLM_EFFORT=medium                   # low | medium | high | xhigh | max  (Claude has no temperature)
+LLM_TIMEOUT_SEC=60
 
-# DeepSeek rollback (used automatically when LLM_API_KEY is unset):
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
-# LLM_MODEL=deepseek-v4-pro
-# LLM_BASE_URL=https://api.deepseek.com
-# LLM_TEMPERATURE=0.1
+# OpenAI-compatible alternative (DeepSeek / Kimi K3) - set LLM_PROVIDER=openai:
+# LLM_API_KEY=...
+# LLM_MODEL=kimi-k3                 # or deepseek-v4-pro
+# LLM_BASE_URL=https://api.moonshot.cn/v1   # or https://api.deepseek.com
+# LLM_TEMPERATURE=1.0               # kimi-k3 requires 1.0; DeepSeek 0.1
+# DEEPSEEK_API_KEY=...              # legacy variable name, still honoured
 
 # ========================================
 # TRADING PARAMETERS

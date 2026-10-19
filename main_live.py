@@ -1,7 +1,8 @@
 """
-Live Trading Entrypoint for DeepSeek AI Strategy
+Live Trading Entrypoint for the AI Strategy
 
-Runs the DeepSeek AI strategy on Binance Futures (BTCUSDT-PERP) with live market data.
+Runs the LLM-powered strategy (Anthropic Claude by default) on Binance Futures
+(BTCUSDT-PERP) with live market data.
 """
 
 import os
@@ -81,6 +82,93 @@ def get_env_int(key: str, default: str) -> int:
     return int(value)
 
 
+def get_env_bool(key: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable (true/1/yes/on), ignoring inline comments."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    value = get_env_str(key, 'true' if default else 'false').lower()
+    return value in ('1', 'true', 'yes', 'on')
+
+
+def resolve_llm_settings(strategy_yaml: dict) -> dict:
+    """
+    Resolve the LLM decision-layer settings from environment / YAML.
+
+    Precedence (highest first): LLM_* env vars, ANTHROPIC_API_KEY / legacy
+    DEEPSEEK_* env vars, then `strategy.llm` in configs/strategy_config.yaml.
+
+    Provider selection:
+      * LLM_PROVIDER=anthropic|openai      explicit
+      * LLM_PROVIDER=auto (default)        anthropic if ANTHROPIC_API_KEY is set
+                                           (or the key looks like an Anthropic key /
+                                           the model looks like a Claude model),
+                                           otherwise OpenAI-compatible (DeepSeek/Kimi)
+    """
+    llm_yaml = strategy_yaml.get('llm', {}) or {}
+    # Legacy YAML section name
+    if not llm_yaml and strategy_yaml.get('deepseek'):
+        llm_yaml = strategy_yaml.get('deepseek', {}) or {}
+
+    provider = get_env_str('LLM_PROVIDER', str(llm_yaml.get('provider', 'auto'))).lower()
+
+    anthropic_key = get_env_str('ANTHROPIC_API_KEY', '')
+    generic_key = get_env_str('LLM_API_KEY', '')
+    deepseek_key = get_env_str('DEEPSEEK_API_KEY', '')
+
+    if provider in ('anthropic', 'claude'):
+        provider = 'anthropic'
+        api_key = anthropic_key or generic_key
+    elif provider in ('openai', 'deepseek', 'kimi', 'moonshot', 'openai-compatible'):
+        provider = 'openai'
+        api_key = generic_key or deepseek_key
+    else:
+        # auto
+        if anthropic_key:
+            provider, api_key = 'anthropic', anthropic_key
+        elif generic_key:
+            api_key = generic_key
+            provider = 'anthropic' if generic_key.startswith('sk-ant-') else 'openai'
+        else:
+            provider, api_key = 'openai', deepseek_key
+
+    if not api_key:
+        raise ValueError(
+            "No LLM API key found. Set ANTHROPIC_API_KEY (Claude), or LLM_API_KEY / "
+            "DEEPSEEK_API_KEY for an OpenAI-compatible provider."
+        )
+
+    model = get_env_str('LLM_MODEL', '') or get_env_str('DEEPSEEK_MODEL', '') or str(llm_yaml.get('model', '') or '')
+    base_url = get_env_str('LLM_BASE_URL', '') or get_env_str('DEEPSEEK_BASE_URL', '') or str(llm_yaml.get('base_url', '') or '')
+
+    # A Claude model name with LLM_PROVIDER=auto resolved from a generic key -> anthropic
+    if provider == 'openai' and model.lower().startswith('claude') and not os.getenv('LLM_PROVIDER'):
+        provider = 'anthropic'
+
+    if provider == 'anthropic':
+        # Never send an OpenAI-compatible base URL (e.g. DeepSeek/Moonshot) to the Anthropic SDK
+        if base_url and 'anthropic' not in base_url.lower():
+            print(f"[CONFIG] Ignoring base_url={base_url!r} for provider=anthropic")
+            base_url = ''
+        # A non-Claude model name (typically inherited from a legacy DeepSeek
+        # config) would 404 against the Anthropic API -> use the provider default
+        if model and not model.lower().startswith('claude'):
+            print(f"[CONFIG] Ignoring model={model!r} for provider=anthropic (not a Claude model)")
+            model = ''
+
+    return {
+        'provider': provider,
+        'api_key': api_key,
+        'model': model,
+        'base_url': base_url,
+        'temperature': get_env_float('LLM_TEMPERATURE', get_env_str('DEEPSEEK_TEMPERATURE', str(llm_yaml.get('temperature', 0.1)))),
+        'effort': get_env_str('LLM_EFFORT', str(llm_yaml.get('effort', 'medium'))).lower(),
+        'max_retries': get_env_int('LLM_MAX_RETRIES', str(llm_yaml.get('max_retries', 2))),
+        'timeout_sec': get_env_float('LLM_TIMEOUT_SEC', str(llm_yaml.get('timeout_sec', 60))),
+        'max_tokens': get_env_int('LLM_MAX_TOKENS', str(llm_yaml.get('max_tokens', 1024))),
+    }
+
+
 def get_strategy_config() -> DeepSeekAIStrategyConfig:
     """
     Build strategy configuration from environment variables.
@@ -90,15 +178,22 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     DeepSeekAIStrategyConfig
         Strategy configuration
     """
-    # Get API keys (LLM_* takes precedence over legacy DEEPSEEK_* names)
-    deepseek_api_key = get_env_str('LLM_API_KEY', '') or get_env_str('DEEPSEEK_API_KEY', '')
-    if not deepseek_api_key:
-        raise ValueError("LLM_API_KEY (or DEEPSEEK_API_KEY) not found in environment variables")
-
     # Load YAML config
     yaml_config = load_yaml_config()
     strategy_yaml = yaml_config.get('strategy', {})
-    
+
+    # LLM decision layer (Claude by default)
+    llm = resolve_llm_settings(strategy_yaml)
+    print(f"[CONFIG] LLM provider: {llm['provider']} | model: {llm['model'] or '(provider default)'}")
+
+    # Safety: TEST_MODE / DRY_RUN run the full pipeline but never execute orders
+    # (maps onto the strategy's signal-only shadow mode). Previously these flags
+    # only printed a banner while real orders were still placed.
+    dry_run = get_env_bool('TEST_MODE', False) or get_env_bool('DRY_RUN', False)
+    signal_only_mode = get_env_bool('SIGNAL_ONLY_MODE', False) or dry_run
+    if dry_run:
+        print("[CONFIG] TEST_MODE/DRY_RUN enabled -> signal-only mode (no orders will be placed)")
+
     # Get strategy parameters from env or use defaults
     equity = get_env_float('EQUITY', str(strategy_yaml.get('equity', '400')))
     leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '10')))
@@ -163,12 +258,16 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         bb_period=10 if timeframe == '1m' else 20,
         bb_std=2.0,
 
-        # AI (LLM provider: Kimi/Moonshot, DeepSeek, or any OpenAI-compatible API)
-        deepseek_api_key=deepseek_api_key,
-        deepseek_model=get_env_str('LLM_MODEL', get_env_str('DEEPSEEK_MODEL', 'deepseek-v4-pro')),
-        deepseek_temperature=get_env_float('LLM_TEMPERATURE', get_env_str('DEEPSEEK_TEMPERATURE', '0.1')),
-        deepseek_max_retries=2,
-        deepseek_base_url=get_env_str('LLM_BASE_URL', get_env_str('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')),
+        # AI decision layer (Anthropic Claude by default; DeepSeek/Kimi via OpenAI-compatible API)
+        llm_provider=llm['provider'],
+        llm_api_key=llm['api_key'],
+        llm_model=llm['model'],
+        llm_base_url=llm['base_url'],
+        llm_temperature=llm['temperature'],
+        llm_effort=llm['effort'],
+        llm_max_retries=llm['max_retries'],
+        llm_timeout_sec=llm['timeout_sec'],
+        llm_max_tokens=llm['max_tokens'],
 
         # Sentiment
         sentiment_enabled=True,
@@ -204,8 +303,8 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         trailing_activation_atr=get_env_float('TRAILING_ACTIVATION_ATR', '1.0'),
         trailing_distance_atr=get_env_float('TRAILING_DISTANCE_ATR', '1.0'),
 
-        # Phase 2: signal measurement & regime filter
-        signal_only_mode=get_env_str('SIGNAL_ONLY_MODE', 'false').lower() == 'true',
+        # Phase 2: signal measurement & regime filter (also forced on by TEST_MODE/DRY_RUN)
+        signal_only_mode=signal_only_mode,
         regime_filter_enabled=get_env_str('REGIME_FILTER_ENABLED', 'true').lower() == 'true',
         regime_timeframe=get_env_str('REGIME_TIMEFRAME', '4h'),
         regime_ema_fast=get_env_int('REGIME_EMA_FAST', '20'),
@@ -218,8 +317,12 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
         
-        # Telegram Notifications
-        enable_telegram=strategy_yaml.get('telegram', {}).get('enabled', False),
+        # Telegram Notifications (ENABLE_TELEGRAM env overrides the YAML flag;
+        # previously the env var documented in .env.template had no effect)
+        enable_telegram=get_env_bool(
+            'ENABLE_TELEGRAM',
+            bool(strategy_yaml.get('telegram', {}).get('enabled', False)),
+        ),
         telegram_bot_token=get_env_str('TELEGRAM_BOT_TOKEN', ''),
         telegram_chat_id=get_env_str('TELEGRAM_CHAT_ID', ''),
         telegram_notify_signals=strategy_yaml.get('telegram', {}).get('notify_signals', True),
@@ -327,19 +430,19 @@ def main():
     Main entry point for live trading.
     """
     print("=" * 70)
-    print("DeepSeek AI Trading Strategy - Live Trading Mode")
+    print("AI Trading Strategy - Live Trading Mode")
     print("=" * 70)
     print(f"Exchange: Binance Futures (USDT-M)")
     print(f"Instrument: BTCUSDT-PERP")
-    print(f"Strategy: AI-powered with DeepSeek")
+    print(f"Strategy: LLM-powered (Claude by default; LLM_PROVIDER selects DeepSeek/Kimi)")
     print("=" * 70)
 
     # Safety check
-    test_mode = os.getenv('TEST_MODE', 'false').strip().lower() == 'true'
-    auto_confirm = os.getenv('AUTO_CONFIRM', 'false').strip().lower() == 'true'
-    
+    test_mode = get_env_bool('TEST_MODE', False) or get_env_bool('DRY_RUN', False)
+    auto_confirm = get_env_bool('AUTO_CONFIRM', False)
+
     if test_mode:
-        print("⚠️  TEST_MODE=true - This is a simulation, no real orders will be placed")
+        print("⚠️  TEST_MODE/DRY_RUN=true - signal-only mode: signals are logged, NO orders are placed")
     else:
         print("🚨 LIVE TRADING MODE - Real orders will be placed!")
         if auto_confirm:
@@ -355,7 +458,7 @@ def main():
     config = setup_trading_node()
 
     print(f"✅ Trader ID: {config.trader_id}")
-    print(f"✅ Strategy configured with DeepSeek AI")
+    print(f"✅ Strategy configured with LLM decision layer")
     print(f"✅ Binance Futures adapter configured")
 
     # Create and start trading node
