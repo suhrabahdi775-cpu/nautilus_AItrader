@@ -1351,6 +1351,9 @@ class DeepSeekAIStrategy(Strategy):
                 "has_position": current_position is not None,
                 "position_side": current_position.get('side') if current_position else None,
                 "signal_only": self.signal_only_mode,
+                "forced": bool(signal_data.get('forced', False)),
+                "provider": signal_data.get('provider'),
+                "model": signal_data.get('model'),
                 "reason": str(signal_data.get('reason', ''))[:300],
             }
 
