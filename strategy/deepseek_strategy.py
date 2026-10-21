@@ -178,6 +178,12 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Timing
     timer_interval_sec: int = 900
 
+    # Testing aid (paper venues ONLY - main_live.py refuses it on BINANCE_ENV=live):
+    # bypass the LLM for the first `force_signal_cycles` analysis cycles and push
+    # this signal through the real risk guards / sizing / bracket-order path.
+    force_signal: str = ""  # "" | BUY | SELL
+    force_signal_cycles: int = 1
+
 
 class DeepSeekAIStrategy(Strategy):
     """
@@ -445,6 +451,15 @@ class DeepSeekAIStrategy(Strategy):
         # Strategy control state for remote commands
         self.is_trading_paused = False
         self.strategy_start_time = None
+
+        # Forced test signal (paper venues only)
+        self.force_signal = (config.force_signal or "").strip().upper()
+        self._force_signal_remaining = int(config.force_signal_cycles) if self.force_signal in ("BUY", "SELL") else 0
+        if self._force_signal_remaining:
+            self.log.warning(
+                f"🧪 FORCE_SIGNAL={self.force_signal} active for {self._force_signal_remaining} cycle(s) - "
+                f"the LLM is bypassed and a synthetic signal is executed (paper venues only)"
+            )
 
         # Sentiment data fetcher
         self.sentiment_enabled = config.sentiment_enabled
@@ -770,16 +785,24 @@ class DeepSeekAIStrategy(Strategy):
         # Analyze with the LLM decision layer
         try:
             import time as _time
-            self.log.info(
-                f"Calling LLM ({self.llm.provider}/{self.llm.model}) for analysis..."
-            )
             _t0 = _time.monotonic()
-            signal_data = self.llm.analyze(
-                price_data=price_data,
-                technical_data=technical_data,
-                sentiment_data=sentiment_data,
-                current_position=current_position,
-            )
+            if self._force_signal_remaining > 0:
+                self._force_signal_remaining -= 1
+                signal_data = self._build_forced_signal(price_data)
+                self.log.warning(
+                    f"🧪 Using FORCED test signal {signal_data['signal']} "
+                    f"({self._force_signal_remaining} forced cycle(s) left) - LLM bypassed"
+                )
+            else:
+                self.log.info(
+                    f"Calling LLM ({self.llm.provider}/{self.llm.model}) for analysis..."
+                )
+                signal_data = self.llm.analyze(
+                    price_data=price_data,
+                    technical_data=technical_data,
+                    sentiment_data=sentiment_data,
+                    current_position=current_position,
+                )
             _elapsed = _time.monotonic() - _t0
             self.log.info(
                 f"🤖 Signal: {signal_data['signal']} | "
@@ -843,6 +866,22 @@ class DeepSeekAIStrategy(Strategy):
         # Partial take-profit maintenance: execute R-multiple levels
         if self.enable_partial_tp:
             self._check_partial_take_profits(price_data['price'])
+
+    def _build_forced_signal(self, price_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Synthetic HIGH-confidence signal used by FORCE_SIGNAL (paper venues only)."""
+        price = float(price_data['price'])
+        is_buy = self.force_signal == 'BUY'
+        return {
+            "signal": self.force_signal,
+            "confidence": "HIGH",
+            "reason": "FORCED TEST SIGNAL (FORCE_SIGNAL) - not an AI decision; exercising the order path",
+            "stop_loss": price * (0.98 if is_buy else 1.02),
+            "take_profit": price * (1.02 if is_buy else 0.98),
+            "trend_strength": "MODERATE",
+            "risk_assessment": "MEDIUM",
+            "timestamp": self.clock.utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "forced": True,
+        }
 
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""

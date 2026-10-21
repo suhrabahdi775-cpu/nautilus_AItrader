@@ -192,6 +192,15 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
 
     # LLM decision layer (Claude by default)
     llm = resolve_llm_settings(strategy_yaml)
+
+    # Forced test signal: ONLY on paper venues. Never let a synthetic signal reach a real account.
+    force_signal = get_env_str('FORCE_SIGNAL', '').upper()
+    if force_signal and force_signal not in ('BUY', 'SELL'):
+        raise ValueError(f"FORCE_SIGNAL={force_signal!r} must be BUY or SELL")
+    if force_signal and binance_env == 'live':
+        raise ValueError("FORCE_SIGNAL is only allowed with BINANCE_ENV=testnet or demo")
+    if force_signal:
+        print(f"[CONFIG] 🧪 FORCE_SIGNAL={force_signal} (paper venue {binance_env}) - LLM bypassed for the first cycle(s)")
     print(f"[CONFIG] LLM provider: {llm['provider']} | model: {llm['model'] or '(provider default)'}")
 
     # Safety: TEST_MODE / DRY_RUN run the full pipeline but never execute orders
@@ -323,6 +332,10 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
 
         # Execution
         position_adjustment_threshold=0.001,
+
+        # Testing aid (paper venues only, validated above)
+        force_signal=force_signal,
+        force_signal_cycles=get_env_int('FORCE_SIGNAL_CYCLES', '1'),
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),

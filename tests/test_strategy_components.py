@@ -268,3 +268,29 @@ def test_binance_configs_carry_environment_and_rest_url(monkeypatch):
     assert exec_cfg.environment == BinanceEnvironment.TESTNET
     assert main_live.get_strategy_config("testnet").binance_rest_base_url == "https://testnet.binancefuture.com"
     assert main_live.get_strategy_config("live").binance_rest_base_url == "https://fapi.binance.com"
+
+
+def test_force_signal_refused_on_live_and_allowed_on_paper(monkeypatch):
+    import main_live
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("FORCE_SIGNAL", "BUY")
+    try:
+        main_live.get_strategy_config("live")
+        assert False, "FORCE_SIGNAL must be refused on the live venue"
+    except ValueError as e:
+        assert "testnet" in str(e)
+    cfg = main_live.get_strategy_config("testnet")
+    assert cfg.force_signal == "BUY" and cfg.force_signal_cycles == 1
+    monkeypatch.setenv("FORCE_SIGNAL", "HOLD")
+    try:
+        main_live.get_strategy_config("testnet")
+        assert False
+    except ValueError:
+        pass
+
+
+def test_forced_signal_is_well_formed():
+    strategy = make_strategy_stub(force_signal="SELL", clock=_Clock("2026-10-20 10:00:00"))
+    sig = strategy._build_forced_signal({"price": 1000.0})
+    assert sig["signal"] == "SELL" and sig["confidence"] == "HIGH" and sig["forced"] is True
+    assert sig["take_profit"] < 1000.0 < sig["stop_loss"]
