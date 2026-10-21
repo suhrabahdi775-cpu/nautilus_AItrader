@@ -14,6 +14,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType, BinanceEnvironment
+from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
+from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig, BinanceExecClientConfig
 from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory, BinanceLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig, LiveExecEngineConfig, LoggingConfig, TradingNodeConfig
@@ -337,6 +339,11 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         force_signal=force_signal,
         force_signal_cycles=get_env_int('FORCE_SIGNAL_CYCLES', '1'),
 
+        # Exit management & resilience
+        native_exits=get_env_bool('NATIVE_EXITS', True),      # exchange-side SL/TP that survive restarts
+        llm_async=get_env_bool('LLM_ASYNC', True),            # LLM/sentiment/regime calls off the event loop
+        position_state_file=get_env_str('POSITION_STATE_FILE', 'logs/position_state.json'),
+
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
         
@@ -406,6 +413,16 @@ def get_binance_config(environment: str = 'live') -> tuple:
         'demo': BinanceEnvironment.DEMO,
     }[environment]
 
+    # Exchange-side leverage & margin mode for the traded symbol. Previously the
+    # bot never set these, so the account default (often 20x cross) applied.
+    # Position notional is independently capped at max_position_leverage x equity.
+    leverage = get_env_int('BINANCE_LEVERAGE', get_env_str('LEVERAGE', '5'))
+    leverage = max(1, min(leverage, 125))
+    margin_type_str = get_env_str('BINANCE_MARGIN_TYPE', 'isolated').lower()
+    margin_type = BinanceFuturesMarginType.CROSS if margin_type_str in ('cross', 'crossed') else BinanceFuturesMarginType.ISOLATED
+    symbol = BinanceSymbol('BTCUSDT')
+    print(f"[CONFIG] Binance {environment}: leverage {leverage}x, margin {margin_type.name} for {symbol}")
+
     # Data client config
     data_config = BinanceDataClientConfig(
         api_key=api_key,
@@ -422,6 +439,8 @@ def get_binance_config(environment: str = 'live') -> tuple:
         account_type=BinanceAccountType.USDT_FUTURES,
         environment=binance_env,
         instrument_provider=InstrumentProviderConfig(load_all=True),
+        futures_leverages={symbol: leverage},
+        futures_margin_types={symbol: margin_type},
     )
 
     return data_config, exec_config

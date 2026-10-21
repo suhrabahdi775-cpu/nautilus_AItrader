@@ -294,3 +294,19 @@ def test_forced_signal_is_well_formed():
     sig = strategy._build_forced_signal({"price": 1000.0})
     assert sig["signal"] == "SELL" and sig["confidence"] == "HIGH" and sig["forced"] is True
     assert sig["take_profit"] < 1000.0 < sig["stop_loss"]
+
+
+def test_binance_exec_config_pins_leverage_and_margin(monkeypatch):
+    import main_live
+    from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
+    from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
+    monkeypatch.setenv("BINANCE_API_KEY", "k"); monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setenv("BINANCE_LEVERAGE", "7"); monkeypatch.setenv("BINANCE_MARGIN_TYPE", "isolated")
+    _, exec_cfg = main_live.get_binance_config("testnet")
+    assert exec_cfg.futures_leverages == {BinanceSymbol("BTCUSDT"): 7}
+    assert exec_cfg.futures_margin_types == {BinanceSymbol("BTCUSDT"): BinanceFuturesMarginType.ISOLATED}
+    monkeypatch.delenv("BINANCE_LEVERAGE"); monkeypatch.setenv("LEVERAGE", "10 # comment")
+    monkeypatch.setenv("BINANCE_MARGIN_TYPE", "cross")
+    _, exec_cfg = main_live.get_binance_config("live")
+    assert exec_cfg.futures_leverages == {BinanceSymbol("BTCUSDT"): 10}
+    assert exec_cfg.futures_margin_types == {BinanceSymbol("BTCUSDT"): BinanceFuturesMarginType.CROSS}

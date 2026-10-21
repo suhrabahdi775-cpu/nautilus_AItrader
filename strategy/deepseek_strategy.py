@@ -15,6 +15,8 @@ import json
 import math
 import asyncio
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -184,6 +186,12 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     force_signal: str = ""  # "" | BUY | SELL
     force_signal_cycles: int = 1
 
+    # Exit management & resilience
+    native_exits: bool = True  # exchange-side SL (STOP_MARKET) + TP (TAKE_PROFIT_MARKET) that survive restarts;
+                               # False = legacy emulated bracket legs (die with the process)
+    position_state_file: str = "logs/position_state.json"  # persisted exit/trailing/partial-TP state
+    llm_async: bool = True  # run LLM + sentiment + regime network calls on a worker thread (keeps the event loop free)
+
 
 class DeepSeekAIStrategy(Strategy):
     """
@@ -307,6 +315,15 @@ class DeepSeekAIStrategy(Strategy):
         self.disaster_stop_enabled = config.disaster_stop_enabled
         self.disaster_stop_min_pct = config.disaster_stop_min_pct
         self.risk_state_file = config.risk_state_file
+
+        # Exit management & resilience
+        self.native_exits = config.native_exits
+        self.position_state_file = config.position_state_file
+        self.llm_async = config.llm_async
+        self._pending_entry: Optional[Dict[str, Any]] = None  # context for the fill that arms native exits
+        self._loop = None  # asyncio loop captured in on_start (live mode)
+        self._llm_executor: Optional[ThreadPoolExecutor] = None
+        self._analysis_inflight = False
 
         # Kill-switch state (persisted to risk_state_file, survives restarts)
         self.risk_state: Dict[str, Any] = {
@@ -508,6 +525,18 @@ class DeepSeekAIStrategy(Strategy):
 
         self.log.info(f"Loaded instrument: {self.instrument.id}")
 
+        # Worker thread for network-bound analysis (LLM, sentiment, regime)
+        if self.llm_async:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
+            if self._loop is not None:
+                self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-analysis")
+                self.log.info("🧵 LLM analysis runs on a worker thread (event loop stays free)")
+            else:
+                self.log.warning("⚠️ No running event loop - LLM analysis will run synchronously")
+
         # Pre-fetch historical bars before subscribing to live data
         self._prefetch_historical_bars(limit=200)
 
@@ -526,6 +555,13 @@ class DeepSeekAIStrategy(Strategy):
 
         # Restore persisted kill-switch state (daily baseline, loss streaks, pauses)
         self._load_risk_state()
+
+        # Re-adopt a position left open by a previous process (restart/crash) and
+        # make sure it is protected by exchange-side exits
+        try:
+            self._readopt_open_position()
+        except Exception as e:
+            self.log.error(f"❌ Failed to re-adopt open position: {e}", exc_info=True)
 
         # Record start time for uptime tracking
         from datetime import datetime
@@ -555,6 +591,10 @@ class DeepSeekAIStrategy(Strategy):
     def on_stop(self):
         """Actions to be performed on strategy stop."""
         self.log.info("Stopping AI Strategy...")
+
+        if self._llm_executor is not None:
+            self._llm_executor.shutdown(wait=False, cancel_futures=True)
+            self._llm_executor = None
 
         # Cancel pending ENTRY orders only. Reduce-only protective orders (the
         # native disaster stop / trailing stop) must stay on the exchange while
@@ -719,9 +759,20 @@ class DeepSeekAIStrategy(Strategy):
         Periodic analysis and trading logic.
 
         Called every timer_interval_sec seconds (default: 15 minutes).
+
+        Network-bound work (sentiment fetch, higher-timeframe regime, the LLM
+        call) runs on a worker thread so the trading event loop - which also
+        processes fills, position events and emulated orders - is never blocked
+        for the 5-60 s an LLM round trip can take. The result is handed back to
+        the event loop via `call_soon_threadsafe` and acted on in
+        `_on_analysis_complete`.
         """
         self.log.info("=" * 60)
         self.log.info("Running periodic analysis...")
+
+        if self._analysis_inflight:
+            self.log.warning("⏳ Previous analysis still in flight (slow LLM?) - skipping this cycle")
+            return
 
         # Check if indicators are ready
         if not self.indicator_manager.is_initialized():
@@ -748,16 +799,6 @@ class DeepSeekAIStrategy(Strategy):
         kline_data = self.indicator_manager.get_kline_data(count=10)
         self.log.debug(f"Retrieved {len(kline_data)} K-lines for analysis")
 
-        # Get sentiment data
-        sentiment_data = None
-        if self.sentiment_enabled and self.sentiment_fetcher:
-            try:
-                sentiment_data = self.sentiment_fetcher.fetch()
-                if sentiment_data:
-                    self.log.info(self.sentiment_fetcher.format_for_display(sentiment_data))
-            except Exception as e:
-                self.log.warning(f"Failed to fetch sentiment data: {e}")
-
         # Build price data for AI
         price_data = {
             'price': current_price,
@@ -782,83 +823,150 @@ class DeepSeekAIStrategy(Strategy):
                 f"{current_position['quantity']} @ ${current_position['avg_px']:.2f}"
             )
 
-        # Analyze with the LLM decision layer
-        try:
-            import time as _time
-            _t0 = _time.monotonic()
-            if self._force_signal_remaining > 0:
-                self._force_signal_remaining -= 1
-                signal_data = self._build_forced_signal(price_data)
-                self.log.warning(
-                    f"🧪 Using FORCED test signal {signal_data['signal']} "
-                    f"({self._force_signal_remaining} forced cycle(s) left) - LLM bypassed"
-                )
-            else:
-                self.log.info(
-                    f"Calling LLM ({self.llm.provider}/{self.llm.model}) for analysis..."
-                )
-                signal_data = self.llm.analyze(
-                    price_data=price_data,
-                    technical_data=technical_data,
-                    sentiment_data=sentiment_data,
-                    current_position=current_position,
-                )
-            _elapsed = _time.monotonic() - _t0
-            self.log.info(
-                f"🤖 Signal: {signal_data['signal']} | "
-                f"Confidence: {signal_data['confidence']} | "
-                f"API time: {_elapsed:.1f}s"
-                + (" | FALLBACK" if signal_data.get('is_fallback') else "")
-                + f" | Reason: {signal_data['reason']}"
-            )
-            
-            # Send Telegram signal notification (only for actionable signals)
-            if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
-                if signal_data['signal'] in ['BUY', 'SELL']:
-                    try:
-                        signal_notification = self.telegram_bot.format_trade_signal({
-                            'signal': signal_data['signal'],
-                            'confidence': signal_data['confidence'],
-                            'price': price_data['price'],
-                            'timestamp': price_data['timestamp'],
-                            'rsi': technical_data.get('rsi', 0),
-                            'macd': technical_data.get('macd', 0),
-                            'support': technical_data.get('support', 0),
-                            'resistance': technical_data.get('resistance', 0),
-                            'reasoning': signal_data['reason'],
-                        })
-                        self.telegram_bot.send_message_sync(signal_notification)
-                    except Exception as e:
-                        self.log.warning(f"Failed to send Telegram signal notification: {e}")
-                        
-        except Exception as e:
-            self.log.error(f"LLM analysis failed: {e}", exc_info=True)
+        # Forced test signal (paper venues only) is built on the event-loop thread
+        forced_signal = None
+        if self._force_signal_remaining > 0:
+            self._force_signal_remaining -= 1
+            forced_signal = self._build_forced_signal(price_data)
 
-            # Send error notification
+        ctx = {
+            'price_data': price_data,
+            'technical_data': technical_data,
+            'current_position': current_position,
+            'forced_signal': forced_signal,
+            'regime_needed': self.regime_filter_enabled and self._regime_cache_stale(),
+        }
+
+        if self._llm_executor is not None and self._loop is not None:
+            self._analysis_inflight = True
+            self.log.info(
+                f"Calling LLM ({self.llm.provider}/{self.llm.model}) on worker thread..."
+                if forced_signal is None else "🧪 Forced signal - skipping LLM call"
+            )
+            self._llm_executor.submit(self._analysis_worker, ctx)
+        else:
+            self.log.info(f"Calling LLM ({self.llm.provider}/{self.llm.model}) for analysis...")
+            self._on_analysis_complete(ctx, self._run_analysis(ctx))
+
+    def _run_analysis(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Network-bound part of a cycle: sentiment, regime and the LLM decision.
+
+        Safe to run on a worker thread: touches no NautilusTrader state other
+        than logging. Never raises - errors are returned in the result.
+        """
+        result: Dict[str, Any] = {'sentiment': None, 'regime': None, 'signal': None, 'error': None, 'elapsed': 0.0}
+        try:
+            if self.sentiment_enabled and self.sentiment_fetcher:
+                try:
+                    result['sentiment'] = self.sentiment_fetcher.fetch()
+                except Exception as e:
+                    self.log.warning(f"Failed to fetch sentiment data: {e}")
+
+            if ctx.get('regime_needed'):
+                result['regime'] = self._fetch_regime()
+
+            t0 = time.monotonic()
+            if ctx.get('forced_signal') is not None:
+                result['signal'] = ctx['forced_signal']
+            else:
+                result['signal'] = self.llm.analyze(
+                    price_data=ctx['price_data'],
+                    technical_data=ctx['technical_data'],
+                    sentiment_data=result['sentiment'],
+                    current_position=ctx['current_position'],
+                )
+            result['elapsed'] = time.monotonic() - t0
+        except Exception as e:  # noqa: BLE001 - never let the worker die silently
+            result['error'] = e
+        return result
+
+    def _analysis_worker(self, ctx: Dict[str, Any]) -> None:
+        """Worker-thread entry point: run the analysis, hand the result to the event loop."""
+        result = self._run_analysis(ctx)
+        try:
+            self._loop.call_soon_threadsafe(self._on_analysis_complete, ctx, result)
+        except RuntimeError as e:  # loop closed during shutdown
+            self._analysis_inflight = False
+            self.log.warning(f"⚠️ Could not deliver analysis result to event loop: {e}")
+
+    def _on_analysis_complete(self, ctx: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Event-loop side of a cycle: log, notify, execute and run maintenance."""
+        self._analysis_inflight = False
+        price_data = ctx['price_data']
+        technical_data = ctx['technical_data']
+        current_position = ctx['current_position']
+
+        if result.get('regime') is not None:
+            self._regime_cache = {"value": result['regime'], "ts": time.monotonic()}
+
+        if result.get('sentiment'):
+            try:
+                self.log.info(self.sentiment_fetcher.format_for_display(result['sentiment']))
+            except Exception:
+                pass
+
+        error = result.get('error')
+        if error is not None or result.get('signal') is None:
+            self.log.error(f"LLM analysis failed: {error}")
             if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
                 try:
                     error_msg = self.telegram_bot.format_error_alert({
                         'level': 'ERROR',
-                        'message': f"AI Analysis Failed: {str(e)[:100]}",
-                        'context': 'on_timer'
+                        'message': f"AI Analysis Failed: {str(error)[:100]}",
+                        'context': 'on_timer',
                     })
                     self.telegram_bot.send_message_sync(error_msg)
-                except:
+                except Exception:
                     pass
             return
+
+        signal_data = result['signal']
+        if signal_data.get('forced'):
+            self.log.warning(
+                f"🧪 Using FORCED test signal {signal_data['signal']} "
+                f"({self._force_signal_remaining} forced cycle(s) left) - LLM bypassed"
+            )
+        self.log.info(
+            f"🤖 Signal: {signal_data['signal']} | "
+            f"Confidence: {signal_data['confidence']} | "
+            f"API time: {result.get('elapsed', 0.0):.1f}s"
+            + (" | FALLBACK" if signal_data.get('is_fallback') else "")
+            + f" | Reason: {signal_data['reason']}"
+        )
+
+        # Send Telegram signal notification (only for actionable signals)
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
+            if signal_data['signal'] in ['BUY', 'SELL']:
+                try:
+                    signal_notification = self.telegram_bot.format_trade_signal({
+                        'signal': signal_data['signal'],
+                        'confidence': signal_data['confidence'],
+                        'price': price_data['price'],
+                        'timestamp': price_data['timestamp'],
+                        'rsi': technical_data.get('rsi', 0),
+                        'macd': technical_data.get('macd', 0),
+                        'support': technical_data.get('support', 0),
+                        'resistance': technical_data.get('resistance', 0),
+                        'reasoning': signal_data['reason'],
+                    })
+                    self.telegram_bot.send_message_sync(signal_notification)
+                except Exception as e:
+                    self.log.warning(f"Failed to send Telegram signal notification: {e}")
 
         # Store signal
         self.last_signal = signal_data
 
         # Execute trade
-        self._execute_trade(signal_data, price_data, technical_data, current_position)
-        
+        try:
+            self._execute_trade(signal_data, price_data, technical_data, current_position)
+        except Exception as e:
+            self.log.error(f"❌ Trade execution failed: {e}", exc_info=True)
+
         # Safety maintenance: cancel orphan reduce-only orders left behind when flat.
-        # NOTE: previously gated on the deprecated `self.oco_manager` (always None),
-        # which meant this cleanup never ran.
         if self.enable_oco:
             self._cleanup_oco_orphans()
-        
+
         # Trailing stop maintenance: check and update trailing stops
         if self.enable_trailing_stop:
             self._update_trailing_stops(price_data['price'])
@@ -1173,6 +1281,7 @@ class DeepSeekAIStrategy(Strategy):
                 "order_id": str(order.client_order_id),
                 "price": stop_price,
             }
+            self._save_position_state()
             self.log.info(
                 f"🛡️ Native disaster stop submitted @ ${stop_price:,.2f} "
                 f"({disaster_dist_pct:.2%} from entry, qty {quantity})"
@@ -1253,17 +1362,24 @@ class DeepSeekAIStrategy(Strategy):
         except Exception as e:
             self.log.warning(f"⚠️ Failed to write signal record: {e}")
 
+    def _regime_cache_stale(self) -> bool:
+        """True when the cached regime is missing or older than regime_cache_ttl_sec."""
+        return (
+            self._regime_cache["value"] is None
+            or time.monotonic() - self._regime_cache["ts"] >= self.regime_cache_ttl_sec
+        )
+
     def _get_regime(self) -> str:
-        """Cached higher-timeframe regime: 'up', 'down', 'flat' or 'unknown'."""
-        import time
-        now = time.monotonic()
-        if (
-            self._regime_cache["value"] is not None
-            and now - self._regime_cache["ts"] < self.regime_cache_ttl_sec
-        ):
+        """
+        Cached higher-timeframe regime: 'up', 'down', 'flat' or 'unknown'.
+
+        The cache is normally refreshed by the analysis worker thread; fetching
+        here only happens if that refresh did not run (keeps the loop safe).
+        """
+        if not self._regime_cache_stale():
             return self._regime_cache["value"]
         regime = self._fetch_regime()
-        self._regime_cache = {"value": regime, "ts": now}
+        self._regime_cache = {"value": regime, "ts": time.monotonic()}
         return regime
 
     def _fetch_regime(self) -> str:
@@ -1560,24 +1676,56 @@ class DeepSeekAIStrategy(Strategy):
 
     def _open_new_position(self, side: str, quantity: float):
         """
-        Open new position using bracket order (entry + SL + TP).
+        Open a new, protected position.
 
-        This method submits a bracket order which automatically includes:
-        - Entry order (MARKET)
-        - Stop Loss order (STOP_MARKET)
-        - Take Profit order(s) (LIMIT)
+        native_exits=True (default): MARKET entry; on the fill `on_position_opened`
+        arms exchange-side STOP_MARKET (SL) and TAKE_PROFIT_MARKET (TP) reduce-only
+        algo orders plus the disaster stop. These live on Binance and survive a
+        process crash/restart, and they trigger on the venue - not on this
+        process' event loop.
 
-        The SL and TP orders are linked with OCO, so when one fills, the others cancel.
+        native_exits=False: legacy emulated bracket (entry + SL + TP managed by
+        the NautilusTrader OrderEmulator inside this process).
         """
         order_side = OrderSide.BUY if side == 'long' else OrderSide.SELL
 
-        # Submit bracket order with SL/TP
-        self._submit_bracket_order(
-            side=order_side,
-            quantity=quantity,
-        )
+        if not self.native_exits:
+            self._submit_bracket_order(side=order_side, quantity=quantity)
+            self.log.info(f"🚀 Opening {side} position: {quantity:.3f} BTC (with emulated bracket SL/TP)")
+            return
 
-        self.log.info(f"🚀 Opening {side} position: {quantity:.3f} BTC (with bracket SL/TP)")
+        if not self.latest_signal_data or not self.latest_technical_data:
+            self.log.error("❌ No signal/technical data available for SL/TP - skipping entry")
+            return
+
+        entry_estimate = float((self.latest_price_data or {}).get('price') or 0.0)
+        if entry_estimate <= 0 and self.indicator_manager.recent_bars:
+            entry_estimate = float(self.indicator_manager.recent_bars[-1].close)
+        if entry_estimate <= 0:
+            self.log.error("❌ Unable to determine entry price estimate - skipping entry")
+            return
+
+        confidence = self.latest_signal_data.get('confidence', 'MEDIUM')
+        sl_estimate = self._calculate_stop_loss_price(side, entry_estimate)
+        tp_estimate = self._calculate_take_profit_price(side, entry_estimate, confidence)
+
+        # Context consumed by on_position_opened when the entry fills
+        self._pending_entry = {
+            'side': 'LONG' if side == 'long' else 'SHORT',
+            'quantity': quantity,
+            'confidence': confidence,
+            'atr': self._get_current_atr(),
+            'est_entry_price': entry_estimate,
+            'est_sl_price': sl_estimate,
+            'est_tp_price': tp_estimate,
+            'ts': self.clock.utc_now().isoformat(),
+        }
+
+        self.log.info(
+            f"🚀 Opening {side} position: {quantity:.3f} BTC (MARKET) - "
+            f"exchange-side SL ~${sl_estimate:,.2f} / TP ~${tp_estimate:,.2f} armed on fill"
+        )
+        self._submit_order(side=order_side, quantity=quantity, reduce_only=False)
 
     def _submit_order(
         self,
@@ -1742,6 +1890,7 @@ class DeepSeekAIStrategy(Strategy):
                         "side": "LONG" if side == OrderSide.BUY else "SHORT",
                         "quantity": quantity,
                         "atr": self._get_current_atr(),
+                        "native": False,
                     }
                     self.log.debug(
                         f"📌 Saved SL order ID for trailing stop: {str(sl_order.client_order_id)[:8]}..."
@@ -1756,6 +1905,7 @@ class DeepSeekAIStrategy(Strategy):
                     "original_quantity": quantity,
                     "levels_done": [],
                 }
+            self._save_position_state()
 
         except Exception as e:
             # Phase 0: never fall back to an unprotected naked entry
@@ -1807,9 +1957,30 @@ class DeepSeekAIStrategy(Strategy):
             f"{event.quantity} @ {event.avg_px_open}"
         )
 
-        # Update trailing stop state with actual entry price if it exists
-        # (bracket order already initialized it with estimated price)
-        if self.enable_trailing_stop:
+        if self.native_exits:
+            # Arm exchange-side SL/TP from the ACTUAL fill price
+            pending = self._pending_entry or {}
+            self._pending_entry = None
+            side_name = 'LONG' if event.side == PositionSide.LONG else 'SHORT'
+            confidence = pending.get('confidence') or (self.latest_signal_data or {}).get('confidence', 'MEDIUM')
+            if pending and pending.get('side') != side_name:
+                self.log.warning(
+                    f"⚠️ Pending entry side {pending.get('side')} != opened {side_name}; "
+                    f"arming exits from current indicators"
+                )
+            try:
+                self._arm_native_exits(
+                    side=side_name,
+                    quantity=float(event.quantity),
+                    entry_price=float(event.avg_px_open),
+                    confidence=confidence,
+                )
+            except Exception as e:
+                self.log.error(f"❌ Failed to arm exchange-side exits: {e}", exc_info=True)
+
+        # Legacy emulated-bracket bookkeeping: update trailing stop state with the
+        # actual entry price (bracket initialised it with the estimate)
+        if not self.native_exits and self.enable_trailing_stop:
             instrument_key = str(self.instrument_id)
             entry_price = float(event.avg_px_open)
 
@@ -1842,7 +2013,7 @@ class DeepSeekAIStrategy(Strategy):
                 )
 
         # Phase 0: native exchange-side catastrophic stop, independent of the
-        # (emulated) bracket SL. Protects the position if this process dies.
+        # regular SL (defense in depth; placed at 2x the SL distance, min 1.5%).
         if self.disaster_stop_enabled:
             side_str = 'long' if event.side == PositionSide.LONG else 'short'
             self._submit_disaster_stop(
@@ -1850,6 +2021,8 @@ class DeepSeekAIStrategy(Strategy):
                 quantity=float(event.quantity),
                 entry_price=float(event.avg_px_open),
             )
+
+        self._save_position_state()
 
         # Send Telegram position opened notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
@@ -1894,8 +2067,11 @@ class DeepSeekAIStrategy(Strategy):
             )
         self._save_risk_state()
 
-        # Cancel the native disaster stop (position is flat now)
+        # Cancel remaining exchange-side exit orders (Binance also auto-cancels
+        # reduce-only orders when flat; this is belt-and-braces and immediate)
+        self._cancel_native_exit_orders()
         self._cancel_disaster_stop()
+        self._pending_entry = None
 
         # Clear trailing stop state
         instrument_key = str(self.instrument_id)
@@ -1907,6 +2083,8 @@ class DeepSeekAIStrategy(Strategy):
         if instrument_key in self.partial_tp_state:
             del self.partial_tp_state[instrument_key]
             self.log.debug(f"🗑️ Cleared partial TP state for {instrument_key}")
+
+        self._clear_position_state()
         
         # Send Telegram position closed notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
@@ -2166,12 +2344,39 @@ class DeepSeekAIStrategy(Strategy):
                 except Exception as e:
                     self.log.warning(f"⚠️ Could not look up SL order {old_sl_order_id[:8]}...: {e}")
 
+            if state.get("native"):
+                # Exchange-side STOP_MARKET orders cannot be modified on Binance:
+                # submit the replacement FIRST (no unprotected window), then cancel
+                # the old stop. The TP is an independent native order - untouched.
+                exit_side = OrderSide.SELL if side == "LONG" else OrderSide.BUY
+                new_sl_order = self.order_factory.stop_market(
+                    instrument_id=self.instrument_id,
+                    order_side=exit_side,
+                    quantity=self.instrument.make_qty(quantity),
+                    trigger_price=self.instrument.make_price(new_sl_price),
+                    trigger_type=TriggerType.LAST_PRICE,
+                    time_in_force=TimeInForce.GTC,
+                    reduce_only=True,
+                )
+                self.submit_order(new_sl_order)
+                if old_order is not None and old_order.is_open:
+                    self.cancel_order(old_order)
+                state["current_sl_price"] = new_sl_price
+                state["sl_order_id"] = str(new_sl_order.client_order_id)
+                self._save_position_state()
+                self.log.info(
+                    f"✅ Trailing SL replaced on exchange @ ${new_sl_price:,.2f} "
+                    f"(new {state['sl_order_id'][:8]}..., TP untouched)"
+                )
+                return
+
             if old_order is not None and old_order.is_open:
                 self.modify_order(
                     old_order,
                     trigger_price=self.instrument.make_price(new_sl_price),
                 )
                 state["current_sl_price"] = new_sl_price
+                self._save_position_state()
                 self.log.info(
                     f"✅ Trailing SL trigger modified in place @ ${new_sl_price:,.2f} "
                     f"(order {old_sl_order_id[:8]}..., TP leg preserved)"
@@ -2197,6 +2402,8 @@ class DeepSeekAIStrategy(Strategy):
             # Update state
             state["current_sl_price"] = new_sl_price
             state["sl_order_id"] = str(new_sl_order.client_order_id)
+            state["native"] = True
+            self._save_position_state()
 
             self.log.info(f"✅ New trailing SL order submitted @ ${new_sl_price:,.2f}")
 
@@ -2251,7 +2458,12 @@ class DeepSeekAIStrategy(Strategy):
                 # Keep tracked trailing-stop quantity in sync with reduced position
                 if instrument_key in self.trailing_stop_state:
                     remaining = self.trailing_stop_state[instrument_key]["quantity"] - qty
-                    self.trailing_stop_state[instrument_key]["quantity"] = max(0.0, remaining)
+                    remaining = max(0.0, math.floor(remaining * 1000) / 1000)
+                    self.trailing_stop_state[instrument_key]["quantity"] = remaining
+                    # Exchange-side exits are sized for the original quantity: resize them
+                    if self.trailing_stop_state[instrument_key].get("native") and remaining > 0:
+                        self._replace_native_exits(remaining)
+                self._save_position_state()
 
                 self.log.info(
                     f"💰 Partial TP level {idx + 1} hit at {r_now:.2f}R: "
@@ -2276,6 +2488,325 @@ class DeepSeekAIStrategy(Strategy):
 
         except Exception as e:
             self.log.error(f"❌ Partial take-profit check failed: {e}")
+
+    # ===== Exchange-side exits, persistence & restart re-adoption =====
+
+    def _order_is_open(self, order_id: Optional[str]) -> bool:
+        """True if the order with this client order id is known to the cache and open."""
+        if not order_id:
+            return False
+        try:
+            order = self.cache.order(ClientOrderId(order_id))
+            return order is not None and order.is_open
+        except Exception:
+            return False
+
+    def _arm_native_exits(
+        self,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        confidence: str,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+    ) -> None:
+        """
+        Place exchange-side reduce-only exits for an open position:
+        STOP_MARKET (stop loss) + TAKE_PROFIT_MARKET (take profit).
+
+        Both are Binance conditional (algo) orders: they trigger on the venue,
+        survive restarts, and Binance auto-cancels the survivor when the
+        position is flat (reduce-only). Also initialises trailing / partial-TP
+        bookkeeping (keyed by instrument) and persists it.
+        """
+        side = side.upper()
+        side_lc = 'long' if side == 'LONG' else 'short'
+        if sl_price is None:
+            sl_price = self._calculate_stop_loss_price(side_lc, entry_price)
+        if tp_price is None:
+            tp_price = self._calculate_take_profit_price(side_lc, entry_price, confidence)
+
+        # Sanity: a stop on the wrong side of the entry would trigger instantly
+        # (Binance -2021). Fall back to a plain 2% / 4% structure.
+        if side == 'LONG' and not (sl_price < entry_price < tp_price):
+            self.log.warning(f"⚠️ Inconsistent LONG exits SL {sl_price:.2f} / entry {entry_price:.2f} / TP {tp_price:.2f} - using 2%/4%")
+            sl_price, tp_price = entry_price * 0.98, entry_price * 1.04
+        if side == 'SHORT' and not (tp_price < entry_price < sl_price):
+            self.log.warning(f"⚠️ Inconsistent SHORT exits TP {tp_price:.2f} / entry {entry_price:.2f} / SL {sl_price:.2f} - using 2%/4%")
+            sl_price, tp_price = entry_price * 1.02, entry_price * 0.96
+
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        qty = self.instrument.make_qty(quantity)
+
+        sl_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id,
+            order_side=exit_side,
+            quantity=qty,
+            trigger_price=self.instrument.make_price(sl_price),
+            trigger_type=TriggerType.LAST_PRICE,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+        )
+        tp_order = self.order_factory.market_if_touched(
+            instrument_id=self.instrument_id,
+            order_side=exit_side,
+            quantity=qty,
+            trigger_price=self.instrument.make_price(tp_price),
+            trigger_type=TriggerType.LAST_PRICE,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+        )
+        self.submit_order(sl_order)
+        self.submit_order(tp_order)
+
+        key = str(self.instrument_id)
+        previous = self.trailing_stop_state.get(key) or {}
+        self.trailing_stop_state[key] = {
+            "entry_price": entry_price,
+            "highest_price": previous.get("highest_price") if side == 'LONG' else None,
+            "lowest_price": previous.get("lowest_price") if side == 'SHORT' else None,
+            "current_sl_price": sl_price,
+            "sl_order_id": str(sl_order.client_order_id),
+            "tp_price": tp_price,
+            "tp_order_id": str(tp_order.client_order_id),
+            "activated": bool(previous.get("activated", False)),
+            "side": side,
+            "quantity": quantity,
+            "atr": previous.get("atr") or self._get_current_atr(),
+            "native": True,
+        }
+        if self.trailing_stop_state[key]["highest_price"] is None and side == 'LONG':
+            self.trailing_stop_state[key]["highest_price"] = entry_price
+        if self.trailing_stop_state[key]["lowest_price"] is None and side == 'SHORT':
+            self.trailing_stop_state[key]["lowest_price"] = entry_price
+
+        if self.enable_partial_tp and self.partial_tp_levels and key not in self.partial_tp_state:
+            self.partial_tp_state[key] = {
+                "entry_price": entry_price,
+                "sl_distance": abs(entry_price - sl_price),
+                "side": side,
+                "original_quantity": quantity,
+                "levels_done": [],
+            }
+
+        self._save_position_state()
+        self.log.info(
+            f"🛡️ Exchange-side exits armed for {side} {quantity:.3f} BTC @ ${entry_price:,.2f}: "
+            f"SL ${sl_price:,.2f} ({(sl_price / entry_price - 1) * 100:+.2f}%) | "
+            f"TP ${tp_price:,.2f} ({(tp_price / entry_price - 1) * 100:+.2f}%)"
+        )
+
+    def _replace_native_exits(self, new_quantity: float) -> None:
+        """Re-issue the exchange-side SL/TP for a smaller quantity (after a partial close)."""
+        key = str(self.instrument_id)
+        state = self.trailing_stop_state.get(key)
+        if not state or not state.get("native"):
+            return
+        if new_quantity < self.position_config['min_trade_amount']:
+            return
+        old_sl, old_tp = state.get("sl_order_id"), state.get("tp_order_id")
+        side = state["side"]
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        qty = self.instrument.make_qty(new_quantity)
+
+        sl_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id, order_side=exit_side, quantity=qty,
+            trigger_price=self.instrument.make_price(state["current_sl_price"]),
+            trigger_type=TriggerType.LAST_PRICE, time_in_force=TimeInForce.GTC, reduce_only=True,
+        )
+        tp_order = self.order_factory.market_if_touched(
+            instrument_id=self.instrument_id, order_side=exit_side, quantity=qty,
+            trigger_price=self.instrument.make_price(state["tp_price"]),
+            trigger_type=TriggerType.LAST_PRICE, time_in_force=TimeInForce.GTC, reduce_only=True,
+        )
+        self.submit_order(sl_order)
+        self.submit_order(tp_order)
+        for old_id in (old_sl, old_tp):
+            if self._order_is_open(old_id):
+                self.cancel_order(self.cache.order(ClientOrderId(old_id)))
+        state["sl_order_id"] = str(sl_order.client_order_id)
+        state["tp_order_id"] = str(tp_order.client_order_id)
+        state["quantity"] = new_quantity
+        self._save_position_state()
+        self.log.info(f"🔁 Exchange-side exits resized to {new_quantity:.3f} BTC")
+
+    def _cancel_native_exit_orders(self) -> None:
+        """Cancel the tracked exchange-side SL/TP orders if they are still open."""
+        state = self.trailing_stop_state.get(str(self.instrument_id)) or {}
+        for label in ("sl_order_id", "tp_order_id"):
+            order_id = state.get(label)
+            if self._order_is_open(order_id):
+                try:
+                    self.cancel_order(self.cache.order(ClientOrderId(order_id)))
+                    self.log.info(f"🗑️ Cancelled {label.split('_')[0].upper()} exit order {order_id[:8]}...")
+                except Exception as e:
+                    self.log.warning(f"⚠️ Failed to cancel {label}: {e}")
+
+    def _save_position_state(self) -> None:
+        """Persist exit/trailing/partial-TP bookkeeping so a restart can re-adopt the position."""
+        if not self.position_state_file:
+            return
+        try:
+            directory = os.path.dirname(self.position_state_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            payload = {
+                "instrument_id": str(self.instrument_id),
+                "saved_at": self.clock.utc_now().isoformat(),
+                "trailing_stop_state": self.trailing_stop_state,
+                "partial_tp_state": self.partial_tp_state,
+                "disaster_stop_state": self.disaster_stop_state,
+            }
+            tmp = f"{self.position_state_file}.tmp"
+            with open(tmp, 'w') as f:
+                json.dump(payload, f, indent=1, default=str)
+            os.replace(tmp, self.position_state_file)
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not save position state: {e}")
+
+    def _load_position_state(self) -> Optional[Dict[str, Any]]:
+        if not self.position_state_file or not os.path.exists(self.position_state_file):
+            return None
+        try:
+            with open(self.position_state_file, 'r') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not load position state: {e}")
+            return None
+
+    def _clear_position_state(self) -> None:
+        if not self.position_state_file:
+            return
+        try:
+            if os.path.exists(self.position_state_file):
+                os.remove(self.position_state_file)
+        except Exception as e:
+            self.log.warning(f"⚠️ Could not clear position state file: {e}")
+
+    def _readopt_open_position(self) -> None:
+        """
+        On start: take ownership of a position left open by a previous process.
+
+        * No open position -> drop stale persisted state, cancel orphan
+          reduce-only orders.
+        * Open position -> restore trailing / partial-TP / disaster bookkeeping
+          from disk when it matches, verify each protective order still exists
+          on the venue (by id, else by scanning open reduce-only orders) and
+          re-arm whatever is missing. If the stop or target was breached while
+          offline, close at market immediately.
+        """
+        key = str(self.instrument_id)
+        saved = self._load_position_state()
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+
+        if not positions:
+            if saved:
+                self.log.info("ℹ️ Persisted position state found but no open position (closed while offline) - clearing")
+                self._clear_position_state()
+            self._cleanup_oco_orphans()
+            return
+
+        position = positions[0]
+        side = 'LONG' if position.side == PositionSide.LONG else 'SHORT'
+        qty = float(position.quantity)
+        entry = float(position.avg_px_open)
+        bars = self.indicator_manager.recent_bars
+        price = float(bars[-1].close) if bars else entry
+
+        # ATR-based exit maths needs technical data (none yet right after start)
+        try:
+            self.latest_technical_data = self.indicator_manager.get_technical_data(price)
+        except Exception as e:
+            self.log.warning(f"⚠️ Technical data unavailable during re-adoption: {e}")
+
+        restored = False
+        if saved and (saved.get("trailing_stop_state") or {}).get(key, {}).get("side") == side:
+            self.trailing_stop_state = saved.get("trailing_stop_state") or {}
+            self.partial_tp_state = saved.get("partial_tp_state") or {}
+            self.disaster_stop_state = saved.get("disaster_stop_state") or {}
+            self.trailing_stop_state[key]["quantity"] = qty  # the venue is the truth
+            restored = True
+
+        self.log.warning(
+            f"♻️ Re-adopting open {side} position {qty:.3f} BTC @ ${entry:,.2f} "
+            f"(mark ${price:,.2f}, persisted state {'restored' if restored else 'not available'})"
+        )
+
+        state = self.trailing_stop_state.get(key) or {}
+        confidence = (self.latest_signal_data or {}).get('confidence', 'MEDIUM')
+        side_lc = side.lower()
+        sl_price = state.get("current_sl_price") or self._calculate_stop_loss_price(side_lc, entry)
+        tp_price = state.get("tp_price") or self._calculate_take_profit_price(side_lc, entry, confidence)
+
+        # Breached while offline? Then the position should already be closed - do it now.
+        exit_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+        if (side == 'LONG' and price <= sl_price) or (side == 'SHORT' and price >= sl_price):
+            self.log.error(f"🛑 Stop ${sl_price:,.2f} breached while offline (mark ${price:,.2f}) - closing at market")
+            self._submit_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+        if (side == 'LONG' and price >= tp_price) or (side == 'SHORT' and price <= tp_price):
+            self.log.info(f"🎯 Target ${tp_price:,.2f} reached while offline (mark ${price:,.2f}) - closing at market")
+            self._submit_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+
+        # Which protective orders are still live on the venue?
+        open_ro = [o for o in self.cache.orders_open(instrument_id=self.instrument_id) if o.is_reduce_only]
+        sl_ok = self._order_is_open(state.get("sl_order_id"))
+        tp_ok = self._order_is_open(state.get("tp_order_id"))
+        disaster = self.disaster_stop_state.get(key) or {}
+        disaster_ok = self._order_is_open(disaster.get("order_id"))
+
+        if not (sl_ok and tp_ok and disaster_ok):
+            # Adopt by scanning (ids may differ after reconciliation)
+            known = {state.get("sl_order_id"), state.get("tp_order_id"), disaster.get("order_id")}
+            stops = sorted(
+                [o for o in open_ro if o.order_type == OrderType.STOP_MARKET and str(o.client_order_id) not in known],
+                key=lambda o: abs(float(o.trigger_price) - entry),
+            )
+            mits = [o for o in open_ro if o.order_type == OrderType.MARKET_IF_TOUCHED and str(o.client_order_id) not in known]
+            if not sl_ok and stops:
+                o = stops.pop(0)
+                state["sl_order_id"], state["current_sl_price"], sl_ok = str(o.client_order_id), float(o.trigger_price), True
+                sl_price = state["current_sl_price"]
+            if not disaster_ok and stops:
+                o = stops.pop(-1)
+                self.disaster_stop_state[key] = {"order_id": str(o.client_order_id), "price": float(o.trigger_price)}
+                disaster_ok = True
+            if not tp_ok and mits:
+                o = mits.pop(0)
+                state["tp_order_id"], state["tp_price"], tp_ok = str(o.client_order_id), float(o.trigger_price), True
+                tp_price = state["tp_price"]
+
+        if sl_ok and tp_ok:
+            if key not in self.trailing_stop_state:
+                self.trailing_stop_state[key] = state
+            state.update({"side": side, "quantity": qty, "entry_price": state.get("entry_price", entry), "native": True})
+            state.setdefault("activated", False)
+            state.setdefault("atr", self._get_current_atr())
+            state.setdefault("highest_price", entry if side == 'LONG' else None)
+            state.setdefault("lowest_price", entry if side == 'SHORT' else None)
+            self.log.info(f"✅ Exchange-side exits already live: SL ${sl_price:,.2f} | TP ${tp_price:,.2f}")
+        else:
+            # Re-arm both at the saved prices; cancel any lone survivor first to avoid duplicates
+            for order_id in (state.get("sl_order_id") if sl_ok else None, state.get("tp_order_id") if tp_ok else None):
+                if order_id and self._order_is_open(order_id):
+                    self.cancel_order(self.cache.order(ClientOrderId(order_id)))
+            self.log.warning("🛡️ Protective exits missing after restart - re-arming on the exchange")
+            self._arm_native_exits(side, qty, entry, confidence, sl_price=sl_price, tp_price=tp_price)
+
+        if key not in self.partial_tp_state and self.enable_partial_tp and self.partial_tp_levels:
+            self.partial_tp_state[key] = {
+                "entry_price": entry, "sl_distance": abs(entry - sl_price), "side": side,
+                "original_quantity": qty, "levels_done": [],
+            }
+
+        if not disaster_ok:
+            self.disaster_stop_state.pop(key, None)
+            if self.disaster_stop_enabled:
+                self._submit_disaster_stop(side_lc, qty, entry)
+
+        self._save_position_state()
 
     # ===== Remote Control Methods (for Telegram commands) =====
     
