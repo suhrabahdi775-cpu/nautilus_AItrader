@@ -29,11 +29,45 @@ python tests/manual_order_test.py --dry-run --signal BUY
 | `test_rounding_fix.py` | Quantity flooring to 0.001 and the Phase 0 "skip, never upsize" rule |
 | `test_integration_mock.py` | Mocked Binance -> indicators -> AI -> order-decision flow |
 
-## Live smoke test (no orders)
+## Live tests on Binance Futures Testnet (paper money)
+
+Testnet/demo keys are separate from live keys (create them at
+testnet.binancefuture.com) and are rejected by live Binance with
+`-2015`/`-2008`. Set `BINANCE_ENV=testnet` (or `demo`) in `.env`.
+
+**1. Signal-only (no orders), real market data + real Claude calls**
 
 ```bash
-TEST_MODE=true AUTO_CONFIRM=true python main_live.py
+TEST_MODE=true AUTO_CONFIRM=true TIMER_INTERVAL_SEC=60 python main_live.py
 ```
 
-Runs the full node with real market data and real Claude calls in signal-only
-mode; check `logs/signal_log.jsonl` for the recorded signals.
+Expect in the log: `LLM analyzer ready`, `Pre-fetched 199 bars ... Indicators
+ready: True`, `Subscribed to ...15-MINUTE...`, then one `🤖 Signal:` line per
+cycle without `FALLBACK`, and `Signal-only mode: signal recorded`. Signals are
+appended to `logs/signal_log.jsonl` for `tools/score_signals.py`.
+
+**2. Order path (paper orders), forced first signal**
+
+```bash
+TEST_MODE=false FORCE_SIGNAL=BUY TIMER_INTERVAL_SEC=60 python main_live.py
+```
+
+`FORCE_SIGNAL` is refused when `BINANCE_ENV=live`. The first cycle pushes a
+synthetic HIGH-confidence signal through the unchanged risk guards, sizing,
+bracket order and disaster-stop code; later cycles use the LLM. Expect
+`Position Sizing`, `Creating bracket order`, `Order filled`, `Position opened`,
+`Native disaster stop submitted`. Verified 2026-10-21: entry filled, stop
+accepted by Binance, stop kept on the exchange across shutdown.
+
+Note: Binance Futures now serves conditional orders (STOP_MARKET etc.) through
+its **algo-order API** - they appear under `GET /fapi/v1/openAlgoOrders`, not
+`GET /fapi/v1/openOrders`. Checking only `openOrders` wrongly suggests the
+stop is missing.
+
+Clean up afterwards (close the paper position, cancel the stop) from the
+Binance testnet UI or via `DELETE /fapi/v1/algoOrder` + a reduce-only MARKET.
+
+**Observed on 2026-10-21 (testnet, claude-opus-5-5, effort=medium):** Claude
+latency 6.7-9.7 s per cycle; sizing on $5,000 paper equity -> 0.118 BTC
+(capped at 2x equity notional); round-trip taker commission ~$8 on ~$9.9k
+notional.
