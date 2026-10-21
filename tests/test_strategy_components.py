@@ -266,7 +266,9 @@ def test_binance_configs_carry_environment_and_rest_url(monkeypatch):
     data_cfg, exec_cfg = main_live.get_binance_config("testnet")
     assert data_cfg.environment == BinanceEnvironment.TESTNET
     assert exec_cfg.environment == BinanceEnvironment.TESTNET
-    assert main_live.get_strategy_config("testnet").binance_rest_base_url == "https://testnet.binancefuture.com"
+    cfg = main_live.get_strategy_config("testnet")
+    assert cfg.binance_rest_base_url == "https://testnet.binancefuture.com"
+    assert cfg.external_order_claims == ["BTCUSDT-PERP.BINANCE"]
     assert main_live.get_strategy_config("live").binance_rest_base_url == "https://fapi.binance.com"
 
 

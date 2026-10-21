@@ -256,6 +256,10 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         instrument_id="BTCUSDT-PERP.BINANCE",
         bar_type=final_bar_type,
         binance_rest_base_url=BINANCE_REST_BASE_URLS[binance_env],
+        # Claim external orders/fills on our instrument (e.g. a manual close in the
+        # Binance app) so on_position_closed fires and protective exits are cancelled
+        # immediately instead of lingering until the next orphan sweep.
+        external_order_claims=["BTCUSDT-PERP.BINANCE"],
 
         # Capital
         equity=equity,
