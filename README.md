@@ -55,6 +55,24 @@ Haiku 5.5 ≈ $0.05/day.
 
 ---
 
+## Execution & Resilience Model
+
+| Concern | How it works now |
+|---|---|
+| Entry | MARKET order sized from **live equity** × `RISK_PER_TRADE_PCT` over the ATR stop distance, capped at `MAX_POSITION_LEVERAGE` × equity, skipped (never upsized) below Binance's $100 minimum notional |
+| Stop loss / take profit | **Exchange-side** reduce-only `STOP_MARKET` + `TAKE_PROFIT_MARKET` (Binance algo orders) armed from the actual fill price (`NATIVE_EXITS=true`). They trigger on the venue and survive crashes/restarts. A second, wider `STOP_MARKET` (2× SL distance, min 1.5%) is the disaster stop |
+| Trailing stop | Replace-then-cancel of the exchange-side stop (conditional orders cannot be modified on Binance); TP untouched |
+| Partial take-profit | Reduce-only MARKET at `r_multiple`; SL/TP re-issued for the remaining quantity |
+| Restart | `logs/position_state.json` is persisted on every change; on start an open position is re-adopted, protective orders are verified (by id, else by scanning open reduce-only orders) and re-armed if missing; a stop/target breached while offline is closed at market; stale state and orphan orders are swept when flat |
+| Manual intervention | External fills on BTCUSDT-PERP are claimed by the strategy, so closing a position in the Binance app cancels its exits immediately |
+| LLM latency | Claude / sentiment / regime calls run on a worker thread (`LLM_ASYNC=true`); the event loop that processes fills and position events is never blocked |
+| Exchange settings | `BINANCE_LEVERAGE` (default `LEVERAGE` or 5×) and `BINANCE_MARGIN_TYPE` (default isolated) are applied at startup only when they differ and can be changed |
+| Kill-switches | −3% daily loss or 5 consecutive losing closes → 24 h pause (persisted in `logs/risk_state.json`); anti-churn on repeated identical BUY/SELL signals; regime filter (4h EMA 20/50) blocks counter-trend entries and chop |
+
+Verified on Binance Futures Testnet (2026-10-21): entry → exits armed → process killed → restart re-adopted the position with exits intact → external close cancelled all exits and cleared state. See `tests/README.md` for the procedure.
+
+---
+
 ## Features
 
 ### Core Capabilities
@@ -376,6 +394,8 @@ nano .env  # or vim, code, etc.
 BINANCE_ENV=testnet                 # live | testnet | demo  (testnet/demo = paper money, separate keys)
 BINANCE_API_KEY=your_binance_api_key_here
 BINANCE_API_SECRET=your_binance_api_secret_here
+BINANCE_LEVERAGE=5                  # exchange leverage set on BTCUSDT at startup (notional is capped at 2x equity anyway)
+BINANCE_MARGIN_TYPE=isolated        # isolated | cross
 
 # ========================================
 # AI DECISION LAYER (LLM provider)

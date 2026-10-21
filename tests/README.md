@@ -46,7 +46,7 @@ ready: True`, `Subscribed to ...15-MINUTE...`, then one `🤖 Signal:` line per
 cycle without `FALLBACK`, and `Signal-only mode: signal recorded`. Signals are
 appended to `logs/signal_log.jsonl` for `tools/score_signals.py`.
 
-**2. Order path (paper orders), forced first signal**
+**2. Order path (paper orders), forced first signal + restart + manual close**
 
 ```bash
 TEST_MODE=false FORCE_SIGNAL=BUY TIMER_INTERVAL_SEC=60 python main_live.py
@@ -55,17 +55,25 @@ TEST_MODE=false FORCE_SIGNAL=BUY TIMER_INTERVAL_SEC=60 python main_live.py
 `FORCE_SIGNAL` is refused when `BINANCE_ENV=live`. The first cycle pushes a
 synthetic HIGH-confidence signal through the unchanged risk guards, sizing,
 bracket order and disaster-stop code; later cycles use the LLM. Expect
-`Position Sizing`, `Creating bracket order`, `Order filled`, `Position opened`,
-`Native disaster stop submitted`. Verified 2026-10-21: entry filled, stop
-accepted by Binance, stop kept on the exchange across shutdown.
+`Position Sizing`, `Opening long position ... (MARKET)`, `Order filled`,
+`Position opened`, `Exchange-side exits armed`, `Native disaster stop submitted`.
+Then kill the process (Ctrl-C / `./stop_trader.sh`) with the position open and
+start it again WITHOUT `FORCE_SIGNAL`: expect `Re-adopting open LONG position
+... persisted state restored` and `Exchange-side exits already live` with no
+new orders. Closing the position from the Binance UI while the node runs must
+log `Position closed`, `Cancelled SL exit order`, `Cancelled TP exit order`,
+`Cancelled disaster stop`, and remove `logs/position_state.json`.
+
+Verified 2026-10-21 on testnet for all of the above.
 
 Note: Binance Futures now serves conditional orders (STOP_MARKET etc.) through
 its **algo-order API** - they appear under `GET /fapi/v1/openAlgoOrders`, not
 `GET /fapi/v1/openOrders`. Checking only `openOrders` wrongly suggests the
 stop is missing.
 
-Clean up afterwards (close the paper position, cancel the stop) from the
-Binance testnet UI or via `DELETE /fapi/v1/algoOrder` + a reduce-only MARKET.
+Binance does NOT auto-cancel reduce-only algo orders when a position is closed
+by an external order; the strategy cancels them itself (claimed external fills)
+and sweeps any leftovers at startup / each cycle when flat.
 
 **Observed on 2026-10-21 (testnet, claude-opus-5-5, effort=medium):** Claude
 latency 6.7-9.7 s per cycle; sizing on $5,000 paper equity -> 0.118 BTC
