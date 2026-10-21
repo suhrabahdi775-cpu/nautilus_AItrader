@@ -381,7 +381,8 @@ BINANCE_API_SECRET=your_binance_api_secret_here
 # ========================================
 # Claude (Anthropic) is the default decision engine.
 LLM_PROVIDER=anthropic              # anthropic | openai | auto
-ANTHROPIC_API_KEY=sk-ant-...        # https://platform.claude.com/
+ANTHROPIC_API_KEY=sk-ant-...        # https://platform.claude.com/settings/keys
+ANTHROPIC_WORKSPACE_ID=             # wrkspc_... only for keys NOT scoped to one workspace (else leave empty)
 LLM_MODEL=claude-sonnet-5-5         # claude-opus-5-5 for max quality, claude-haiku-5-5 for min cost
 LLM_EFFORT=medium                   # low | medium | high | xhigh | max  (Claude has no temperature)
 LLM_TIMEOUT_SEC=60

@@ -77,6 +77,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     llm_max_retries: int = 2
     llm_timeout_sec: float = 60.0  # bounded: the call blocks the trading event loop
     llm_max_tokens: int = 1024
+    llm_workspace_id: str = ""  # Anthropic only: wrkspc_... (required for multi-workspace keys)
 
     # Legacy DeepSeek-era names (still honoured when the llm_* fields are empty)
     deepseek_api_key: str = ""
@@ -350,6 +351,7 @@ class DeepSeekAIStrategy(Strategy):
             effort=config.llm_effort,
             timeout_sec=config.llm_timeout_sec,
             max_tokens=config.llm_max_tokens,
+            workspace_id=config.llm_workspace_id or os.getenv('ANTHROPIC_WORKSPACE_ID', ''),
             nautilus_logger=self.log,
         )
         # Readable alias; `self.deepseek` is kept for backwards compatibility

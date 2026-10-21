@@ -45,6 +45,7 @@ strategy:
     max_retries: 2
     timeout_sec: 60              # bounded: the LLM call blocks the trading event loop
     max_tokens: 1024
+    workspace_id: ""             # Anthropic only: wrkspc_... for multi-workspace keys (usually set via .env)
 
   # Sentiment data
   sentiment:

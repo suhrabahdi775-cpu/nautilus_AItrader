@@ -85,6 +85,31 @@ def test_default_models_per_provider():
     assert o.model == DEFAULT_OPENAI_MODEL and o.base_url == "https://api.deepseek.com"
 
 
+def test_workspace_id_sets_default_header_and_is_optional():
+    with_ws = LLMAnalyzer(api_key="sk-ant-test", provider="anthropic", workspace_id=" wrkspc_01ABC ")
+    assert with_ws.workspace_id == "wrkspc_01ABC"
+    assert with_ws.client.default_headers.get("anthropic-workspace-id") == "wrkspc_01ABC"
+    without = LLMAnalyzer(api_key="sk-ant-test", provider="anthropic", workspace_id="")
+    assert without.workspace_id is None
+    assert "anthropic-workspace-id" not in without.client.default_headers
+
+
+def test_missing_workspace_header_error_is_actionable():
+    analyzer = _claude(max_retries=1)
+
+    class BadRequest(Exception):
+        status_code = 400
+
+    analyzer.client.messages.create.side_effect = BadRequest(
+        "This API key is not scoped to a workspace, so this request must include the "
+        "anthropic-workspace-id header"
+    )
+    signal = analyzer.analyze(PRICE_DATA, TECHNICAL_DATA, None, None)
+    assert signal["is_fallback"]
+    assert analyzer._structured_output_supported is True  # not misdiagnosed as a schema problem
+    assert analyzer.client.messages.create.call_count == 1
+
+
 def test_signal_schema_is_closed_and_complete():
     assert SIGNAL_SCHEMA["additionalProperties"] is False
     assert set(SIGNAL_SCHEMA["required"]) == set(SIGNAL_SCHEMA["properties"])

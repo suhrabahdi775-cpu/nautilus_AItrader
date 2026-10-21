@@ -166,6 +166,8 @@ def resolve_llm_settings(strategy_yaml: dict) -> dict:
         'max_retries': get_env_int('LLM_MAX_RETRIES', str(llm_yaml.get('max_retries', 2))),
         'timeout_sec': get_env_float('LLM_TIMEOUT_SEC', str(llm_yaml.get('timeout_sec', 60))),
         'max_tokens': get_env_int('LLM_MAX_TOKENS', str(llm_yaml.get('max_tokens', 1024))),
+        # Anthropic multi-workspace keys must send anthropic-workspace-id on every request
+        'workspace_id': get_env_str('ANTHROPIC_WORKSPACE_ID', get_env_str('LLM_WORKSPACE_ID', str(llm_yaml.get('workspace_id', '') or ''))),
     }
 
 
@@ -268,6 +270,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         llm_max_retries=llm['max_retries'],
         llm_timeout_sec=llm['timeout_sec'],
         llm_max_tokens=llm['max_tokens'],
+        llm_workspace_id=llm['workspace_id'],
 
         # Sentiment
         sentiment_enabled=True,

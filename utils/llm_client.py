@@ -179,6 +179,11 @@ class LLMAnalyzer:
         from the trading event loop, so a bounded timeout is essential.
     max_tokens : int
         Max output tokens for the response.
+    workspace_id : str, optional
+        Anthropic workspace ID (``wrkspc_...``). Required when the API key is a
+        multi-workspace key (not scoped to a single workspace): the API then
+        rejects requests without an ``anthropic-workspace-id`` header. Found at
+        https://platform.claude.com/settings/workspaces. Ignored for other providers.
     nautilus_logger : optional
         NautilusTrader logger (``self.log`` from a Strategy). Falls back to
         the standard ``logging`` module.
@@ -195,6 +200,7 @@ class LLMAnalyzer:
         effort: str = "medium",
         timeout_sec: float = 60.0,
         max_tokens: int = 1024,
+        workspace_id: Optional[str] = None,
         nautilus_logger=None,
     ):
         if not api_key:
@@ -205,6 +211,7 @@ class LLMAnalyzer:
         self.max_retries = max(1, int(max_retries))
         self.timeout_sec = float(timeout_sec)
         self.max_tokens = int(max_tokens)
+        self.workspace_id = (workspace_id or "").strip() or None
         self.effort = effort if effort in VALID_EFFORT else "medium"
         self._structured_output_supported = True  # Anthropic: disabled on first 400
 
@@ -226,6 +233,9 @@ class LLMAnalyzer:
             }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
+            if self.workspace_id:
+                # Multi-workspace keys must name the workspace on every request
+                client_kwargs["default_headers"] = {"anthropic-workspace-id": self.workspace_id}
             self.client = _anthropic.Anthropic(**client_kwargs)
         else:
             if _OpenAI is None:
@@ -385,10 +395,19 @@ class LLMAnalyzer:
                 raise _StructuredOutputUnsupported() from e
             raise
         except Exception as e:  # noqa: BLE001
-            # A 400 mentioning output_config/effort means this model/gateway
-            # rejects structured outputs -> degrade gracefully (once).
             status = getattr(e, "status_code", None)
             text = str(e)
+            if status == 400 and "anthropic-workspace-id" in text:
+                # Multi-workspace key without a workspace header: configuration
+                # problem, not a model problem - say exactly what to set.
+                raise RuntimeError(
+                    "Anthropic API key is not scoped to a workspace. Set "
+                    "ANTHROPIC_WORKSPACE_ID=wrkspc_... in .env (see "
+                    "https://platform.claude.com/settings/workspaces) or create a key "
+                    "scoped to a single workspace."
+                ) from e
+            # A 400 mentioning output_config/effort means this model/gateway
+            # rejects structured outputs -> degrade gracefully (once).
             if (
                 self._structured_output_supported
                 and status == 400
