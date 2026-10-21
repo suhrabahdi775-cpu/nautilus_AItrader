@@ -44,6 +44,9 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Instrument
     instrument_id: str
     bar_type: str
+    # Binance USDT-M REST endpoint for historical klines (prefetch + regime filter).
+    # Must match the venue the data/exec clients connect to (live/testnet/demo).
+    binance_rest_base_url: str = "https://fapi.binance.com"
 
     # Capital
     equity: float = 10000.0
@@ -198,6 +201,7 @@ class DeepSeekAIStrategy(Strategy):
         # Configuration
         self.instrument_id = InstrumentId.from_str(config.instrument_id)
         self.bar_type = BarType.from_str(config.bar_type)
+        self.binance_rest_base_url = (config.binance_rest_base_url or "https://fapi.binance.com").rstrip('/')
 
         # Position sizing config
         self.equity = config.equity
@@ -607,12 +611,12 @@ class DeepSeekAIStrategy(Strategy):
                 interval = '5m'  # Default fallback
 
             self.log.info(
-                f"📡 Pre-fetching {limit} historical bars from Binance "
+                f"📡 Pre-fetching {limit} historical bars from {self.binance_rest_base_url} "
                 f"(symbol={symbol}, interval={interval})..."
             )
 
             # Binance Futures API endpoint
-            url = "https://fapi.binance.com/fapi/v1/klines"
+            url = f"{self.binance_rest_base_url}/fapi/v1/klines"
             params = {
                 'symbol': symbol,
                 'interval': interval,
@@ -1229,7 +1233,7 @@ class DeepSeekAIStrategy(Strategy):
             import requests
             symbol = str(self.instrument_id).split('-')[0]
             response = requests.get(
-                "https://fapi.binance.com/fapi/v1/klines",
+                f"{self.binance_rest_base_url}/fapi/v1/klines",
                 params={
                     "symbol": symbol,
                     "interval": self.regime_timeframe,

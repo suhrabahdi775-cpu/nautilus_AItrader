@@ -237,3 +237,34 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"❌ {name}: {e}")
     sys.exit(1 if failures else 0)
+
+
+# ------------------------------------------------------------ binance env
+
+def test_binance_environment_resolution(monkeypatch):
+    import main_live
+    for raw, expected in [("live", "live"), ("TESTNET", "testnet"), ("demo", "demo"),
+                          ("paper", "demo"), ("prod", "live"), ("testnet   # paper", "testnet")]:
+        monkeypatch.setenv("BINANCE_ENV", raw)
+        assert main_live.resolve_binance_environment() == expected, raw
+    monkeypatch.delenv("BINANCE_ENV", raising=False)
+    assert main_live.resolve_binance_environment() == "live"
+    monkeypatch.setenv("BINANCE_ENV", "staging")
+    try:
+        main_live.resolve_binance_environment()
+        assert False, "invalid env must raise"
+    except ValueError:
+        pass
+
+
+def test_binance_configs_carry_environment_and_rest_url(monkeypatch):
+    import main_live
+    from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    data_cfg, exec_cfg = main_live.get_binance_config("testnet")
+    assert data_cfg.environment == BinanceEnvironment.TESTNET
+    assert exec_cfg.environment == BinanceEnvironment.TESTNET
+    assert main_live.get_strategy_config("testnet").binance_rest_base_url == "https://testnet.binancefuture.com"
+    assert main_live.get_strategy_config("live").binance_rest_base_url == "https://fapi.binance.com"

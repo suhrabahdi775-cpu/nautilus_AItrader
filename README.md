@@ -373,6 +373,7 @@ nano .env  # or vim, code, etc.
 # ========================================
 # EXCHANGE API CREDENTIALS
 # ========================================
+BINANCE_ENV=testnet                 # live | testnet | demo  (testnet/demo = paper money, separate keys)
 BINANCE_API_KEY=your_binance_api_key_here
 BINANCE_API_SECRET=your_binance_api_secret_here
 

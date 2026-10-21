@@ -13,7 +13,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.enums import BinanceAccountType, BinanceEnvironment
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig, BinanceExecClientConfig
 from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory, BinanceLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig, LiveExecEngineConfig, LoggingConfig, TradingNodeConfig
@@ -171,9 +171,15 @@ def resolve_llm_settings(strategy_yaml: dict) -> dict:
     }
 
 
-def get_strategy_config() -> DeepSeekAIStrategyConfig:
+def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
     """
     Build strategy configuration from environment variables.
+
+    Parameters
+    ----------
+    binance_env : str
+        'live' | 'testnet' | 'demo' - selects the REST endpoint the strategy
+        uses for historical klines so indicators match the trading venue.
 
     Returns
     -------
@@ -237,6 +243,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     return DeepSeekAIStrategyConfig(
         instrument_id="BTCUSDT-PERP.BINANCE",
         bar_type=final_bar_type,
+        binance_rest_base_url=BINANCE_REST_BASE_URLS[binance_env],
 
         # Capital
         equity=equity,
@@ -335,9 +342,38 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     )
 
 
-def get_binance_config() -> tuple:
+# Binance USDT-M Futures REST endpoints per environment (used by the strategy's
+# kline prefetch and regime fetch so indicator history matches the trading venue)
+BINANCE_REST_BASE_URLS = {
+    'live': 'https://fapi.binance.com',
+    'testnet': 'https://testnet.binancefuture.com',
+    'demo': 'https://demo-fapi.binance.com',
+}
+
+
+def resolve_binance_environment() -> str:
+    """
+    Resolve BINANCE_ENV -> 'live' | 'testnet' | 'demo' (default: live).
+
+    Testnet/demo keys are issued separately (testnet.binancefuture.com /
+    Binance demo trading) and are rejected by live Binance with -2015/-2008.
+    """
+    env = get_env_str('BINANCE_ENV', 'live').lower()
+    aliases = {'prod': 'live', 'production': 'live', 'mainnet': 'live', 'paper': 'demo', 'test': 'testnet'}
+    env = aliases.get(env, env)
+    if env not in BINANCE_REST_BASE_URLS:
+        raise ValueError(f"BINANCE_ENV={env!r} is not one of live|testnet|demo")
+    return env
+
+
+def get_binance_config(environment: str = 'live') -> tuple:
     """
     Build Binance data and execution client configs.
+
+    Parameters
+    ----------
+    environment : str
+        'live' | 'testnet' | 'demo' (see `resolve_binance_environment`).
 
     Returns
     -------
@@ -345,17 +381,24 @@ def get_binance_config() -> tuple:
         (data_config, exec_config)
     """
     # Get API credentials
-    api_key = os.getenv('BINANCE_API_KEY')
-    api_secret = os.getenv('BINANCE_API_SECRET')
+    api_key = get_env_str('BINANCE_API_KEY', '')
+    api_secret = get_env_str('BINANCE_API_SECRET', '')
 
     if not api_key or not api_secret:
         raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET required in .env")
+
+    binance_env = {
+        'live': BinanceEnvironment.LIVE,
+        'testnet': BinanceEnvironment.TESTNET,
+        'demo': BinanceEnvironment.DEMO,
+    }[environment]
 
     # Data client config
     data_config = BinanceDataClientConfig(
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,  # Binance Futures
+        environment=binance_env,
         instrument_provider=InstrumentProviderConfig(load_all=True),
     )
 
@@ -364,6 +407,7 @@ def get_binance_config() -> tuple:
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,
+        environment=binance_env,
         instrument_provider=InstrumentProviderConfig(load_all=True),
     )
 
@@ -380,8 +424,9 @@ def setup_trading_node() -> TradingNodeConfig:
         Trading node configuration
     """
     # Get configurations
-    strategy_config = get_strategy_config()
-    data_config, exec_config = get_binance_config()
+    binance_env = resolve_binance_environment()
+    strategy_config = get_strategy_config(binance_env)
+    data_config, exec_config = get_binance_config(binance_env)
 
     # Wrap strategy config in ImportableStrategyConfig
     importable_config = ImportableStrategyConfig(
@@ -443,6 +488,12 @@ def main():
     # Safety check
     test_mode = get_env_bool('TEST_MODE', False) or get_env_bool('DRY_RUN', False)
     auto_confirm = get_env_bool('AUTO_CONFIRM', False)
+    binance_env = resolve_binance_environment()
+    if binance_env != 'live':
+        print(f"🧪 BINANCE_ENV={binance_env} - paper trading venue ({BINANCE_REST_BASE_URLS[binance_env]}), no real funds")
+        auto_confirm = True  # nothing real at stake -> no interactive prompt needed
+    else:
+        print("🏦 BINANCE_ENV=live - REAL Binance Futures account")
 
     if test_mode:
         print("⚠️  TEST_MODE/DRY_RUN=true - signal-only mode: signals are logged, NO orders are placed")
