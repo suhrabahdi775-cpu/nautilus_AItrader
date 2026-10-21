@@ -10,6 +10,7 @@ import asyncio
 import yaml
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -386,6 +387,44 @@ def resolve_binance_environment() -> str:
     return env
 
 
+def query_binance_symbol_settings(environment: str, api_key: str, api_secret: str, symbol: str = 'BTCUSDT') -> Optional[dict]:
+    """
+    Read the account's current leverage / margin type / position for `symbol`
+    (signed GET /fapi/v2/positionRisk). Returns None if the query fails.
+
+    Used to make startup idempotent: Binance rejects a margin-type change while
+    a position is open (-4048) and the Nautilus exec client treats that as a
+    failed connect, which would leave an open position unmanaged after a restart.
+    """
+    import hmac
+    import hashlib
+    import time as _time
+    import requests
+
+    base = BINANCE_REST_BASE_URLS[environment]
+    try:
+        query = f"symbol={symbol}&timestamp={int(_time.time() * 1000)}&recvWindow=10000"
+        signature = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        response = requests.get(
+            f"{base}/fapi/v2/positionRisk?{query}&signature={signature}",
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=10,
+        )
+        response.raise_for_status()
+        rows = [r for r in response.json() if r.get('symbol') == symbol]
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            'leverage': int(float(row.get('leverage', 0) or 0)),
+            'margin_type': str(row.get('marginType', '')).lower(),  # 'isolated' | 'cross'
+            'position_amt': float(row.get('positionAmt', 0) or 0),
+        }
+    except Exception as e:  # noqa: BLE001
+        print(f"[CONFIG] ⚠️ Could not read current Binance symbol settings: {e}")
+        return None
+
+
 def get_binance_config(environment: str = 'live') -> tuple:
     """
     Build Binance data and execution client configs.
@@ -421,7 +460,31 @@ def get_binance_config(environment: str = 'live') -> tuple:
     margin_type_str = get_env_str('BINANCE_MARGIN_TYPE', 'isolated').lower()
     margin_type = BinanceFuturesMarginType.CROSS if margin_type_str in ('cross', 'crossed') else BinanceFuturesMarginType.ISOLATED
     symbol = BinanceSymbol('BTCUSDT')
-    print(f"[CONFIG] Binance {environment}: leverage {leverage}x, margin {margin_type.name} for {symbol}")
+
+    # Only send what can actually change: an impossible change (margin type with
+    # an open position) would fail the exec client connect.
+    futures_leverages = {symbol: leverage}
+    futures_margin_types = {symbol: margin_type}
+    current = query_binance_symbol_settings(environment, api_key, api_secret, str(symbol))
+    if current is None:
+        print("[CONFIG] ⚠️ Current symbol settings unknown - not touching leverage/margin at startup")
+        futures_leverages, futures_margin_types = None, None
+    else:
+        if current['leverage'] == leverage:
+            futures_leverages = None
+        if current['margin_type'] == margin_type.name.lower():
+            futures_margin_types = None
+        elif current['position_amt'] != 0:
+            print(
+                f"[CONFIG] ⚠️ Margin type is {current['margin_type']} but {margin_type.name.lower()} requested; "
+                f"cannot change while a position ({current['position_amt']}) is open - keeping current"
+            )
+            futures_margin_types = None
+    print(
+        f"[CONFIG] Binance {environment} {symbol}: leverage {leverage}x "
+        f"({'set at startup' if futures_leverages else 'already set'}), margin {margin_type.name} "
+        f"({'set at startup' if futures_margin_types else 'unchanged'})"
+    )
 
     # Data client config
     data_config = BinanceDataClientConfig(
@@ -439,8 +502,8 @@ def get_binance_config(environment: str = 'live') -> tuple:
         account_type=BinanceAccountType.USDT_FUTURES,
         environment=binance_env,
         instrument_provider=InstrumentProviderConfig(load_all=True),
-        futures_leverages={symbol: leverage},
-        futures_margin_types={symbol: margin_type},
+        futures_leverages=futures_leverages,
+        futures_margin_types=futures_margin_types,
     )
 
     return data_config, exec_config

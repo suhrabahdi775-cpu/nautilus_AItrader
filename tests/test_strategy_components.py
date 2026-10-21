@@ -300,13 +300,39 @@ def test_binance_exec_config_pins_leverage_and_margin(monkeypatch):
     import main_live
     from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
     from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
+    sym = BinanceSymbol("BTCUSDT")
     monkeypatch.setenv("BINANCE_API_KEY", "k"); monkeypatch.setenv("BINANCE_API_SECRET", "s")
     monkeypatch.setenv("BINANCE_LEVERAGE", "7"); monkeypatch.setenv("BINANCE_MARGIN_TYPE", "isolated")
+
+    # Account currently 20x cross and flat -> both get set
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings",
+                        lambda *a, **k: {"leverage": 20, "margin_type": "cross", "position_amt": 0.0})
     _, exec_cfg = main_live.get_binance_config("testnet")
-    assert exec_cfg.futures_leverages == {BinanceSymbol("BTCUSDT"): 7}
-    assert exec_cfg.futures_margin_types == {BinanceSymbol("BTCUSDT"): BinanceFuturesMarginType.ISOLATED}
+    assert exec_cfg.futures_leverages == {sym: 7}
+    assert exec_cfg.futures_margin_types == {sym: BinanceFuturesMarginType.ISOLATED}
+
+    # Already as requested -> nothing sent (idempotent restart)
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings",
+                        lambda *a, **k: {"leverage": 7, "margin_type": "isolated", "position_amt": 0.118})
+    _, exec_cfg = main_live.get_binance_config("testnet")
+    assert exec_cfg.futures_leverages is None and exec_cfg.futures_margin_types is None
+
+    # Margin differs but a position is open -> leverage set, margin left alone (Binance -4048)
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings",
+                        lambda *a, **k: {"leverage": 20, "margin_type": "cross", "position_amt": 0.118})
+    _, exec_cfg = main_live.get_binance_config("testnet")
+    assert exec_cfg.futures_leverages == {sym: 7} and exec_cfg.futures_margin_types is None
+
+    # Query failed -> touch nothing
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings", lambda *a, **k: None)
+    _, exec_cfg = main_live.get_binance_config("testnet")
+    assert exec_cfg.futures_leverages is None and exec_cfg.futures_margin_types is None
+
+    # LEVERAGE fallback with inline comment, cross margin
     monkeypatch.delenv("BINANCE_LEVERAGE"); monkeypatch.setenv("LEVERAGE", "10 # comment")
     monkeypatch.setenv("BINANCE_MARGIN_TYPE", "cross")
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings",
+                        lambda *a, **k: {"leverage": 5, "margin_type": "isolated", "position_amt": 0.0})
     _, exec_cfg = main_live.get_binance_config("live")
-    assert exec_cfg.futures_leverages == {BinanceSymbol("BTCUSDT"): 10}
-    assert exec_cfg.futures_margin_types == {BinanceSymbol("BTCUSDT"): BinanceFuturesMarginType.CROSS}
+    assert exec_cfg.futures_leverages == {sym: 10}
+    assert exec_cfg.futures_margin_types == {sym: BinanceFuturesMarginType.CROSS}
