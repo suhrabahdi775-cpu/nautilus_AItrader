@@ -328,6 +328,7 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         trailing_use_atr=get_env_str('TRAILING_USE_ATR', 'true').lower() == 'true',
         trailing_activation_atr=get_env_float('TRAILING_ACTIVATION_ATR', '1.0'),
         trailing_distance_atr=get_env_float('TRAILING_DISTANCE_ATR', '1.0'),
+        trailing_update_threshold_atr=get_env_float('TRAILING_UPDATE_THRESHOLD_ATR', '0.25'),
 
         # Phase 2: signal measurement & regime filter (also forced on by TEST_MODE/DRY_RUN)
         signal_only_mode=signal_only_mode,

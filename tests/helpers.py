@@ -107,6 +107,7 @@ def make_strategy_stub(**attrs: Any):
         "trailing_activation_pct": 0.01,
         "trailing_distance_pct": 0.005,
         "trailing_update_threshold_pct": 0.002,
+        "trailing_update_threshold_atr": 0.25,
         "latest_signal_data": {"confidence": "HIGH", "signal": "BUY"},
         "latest_technical_data": {"support": 950.0, "resistance": 1050.0, "atr": 0.0},
         "latest_price_data": {"price": 1000.0},

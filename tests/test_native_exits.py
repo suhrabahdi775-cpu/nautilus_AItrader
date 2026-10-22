@@ -304,6 +304,44 @@ def test_run_analysis_and_completion_execute_trade_and_reset_inflight():
     assert strategy.last_signal["signal"] == "BUY"
 
 
+def test_completion_skips_execution_when_position_changed_during_analysis():
+    strategy = _stub(_execute_trade=Mock(), _analysis_inflight=True,
+                     _get_current_position_data=lambda: None)  # flat NOW
+    ctx = {"price_data": {"price": 1000.0, "timestamp": "t"}, "technical_data": {},
+           "current_position": {"side": "short", "quantity": 0.06}}  # was SHORT when analysis started
+    strategy._on_analysis_complete(ctx, {"error": None, "elapsed": 1.0,
+                                         "signal": {"signal": "SELL", "confidence": "MEDIUM", "reason": "r"}})
+    strategy._execute_trade.assert_not_called()
+    assert strategy.log.contains("Position changed during analysis")
+    assert strategy._analysis_inflight is False
+
+
+def test_completion_executes_with_fresh_position_when_unchanged():
+    fresh = {"side": "long", "quantity": 0.05, "avg_px": 1000.0, "unrealized_pnl": 1.0}
+    strategy = _stub(_execute_trade=Mock(), _get_current_position_data=lambda: fresh)
+    ctx = {"price_data": {"price": 1000.0, "timestamp": "t"}, "technical_data": {},
+           "current_position": {"side": "long", "quantity": 0.05}}
+    strategy._on_analysis_complete(ctx, {"error": None, "elapsed": 1.0,
+                                         "signal": {"signal": "HOLD", "confidence": "LOW", "reason": "r"}})
+    strategy._execute_trade.assert_called_once()
+    assert strategy._execute_trade.call_args.args[3] is fresh
+
+
+def test_atr_trailing_uses_atr_step_threshold():
+    old_sl = SimpleNamespace(is_open=True, client_order_id="SL-1")
+    cache = SimpleNamespace(order=lambda cid: old_sl, bars=lambda bt: [], positions_open=lambda **kw: [],
+                            orders_open=lambda **kw: [])
+    state = _open_long_state()
+    state[KEY].update({"current_sl_price": 1019.0, "highest_price": 1030.0})
+    strategy = _stub(enable_trailing_stop=True, trailing_use_atr=True, cache=cache, trailing_stop_state=state)
+
+    strategy._update_trailing_stops(1031.0)  # new SL would be 1021 = +2 < 0.25*ATR(10) -> no move
+    strategy.order_factory.stop_market.assert_not_called()
+
+    strategy._update_trailing_stops(1033.0)  # new SL 1023 = +4 >= 2.5 -> replace
+    assert strategy.order_factory.stop_market.call_args.kwargs["trigger_price"] == 1023.0
+
+
 def test_completion_with_error_does_not_trade():
     strategy = _stub(_execute_trade=Mock(), _analysis_inflight=True)
     ctx = {"price_data": {"price": 1000.0}, "technical_data": {}, "current_position": None}

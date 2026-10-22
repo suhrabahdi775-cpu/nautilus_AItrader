@@ -166,6 +166,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     trailing_use_atr: bool = True  # ATR-based trailing; falls back to pct when ATR unavailable
     trailing_activation_atr: float = 1.0  # Activate trailing at +1 x ATR profit (1R)
     trailing_distance_atr: float = 1.0  # Trail 1 x ATR behind the extreme price
+    trailing_update_threshold_atr: float = 0.25  # Move the stop only when it improves by >= this x ATR
 
     # Phase 2: signal measurement (shadow mode) & higher-timeframe regime filter
     signal_only_mode: bool = False  # Log every evaluated signal WITHOUT executing (calibration dataset)
@@ -272,6 +273,7 @@ class DeepSeekAIStrategy(Strategy):
         self.trailing_use_atr = config.trailing_use_atr
         self.trailing_activation_atr = config.trailing_activation_atr
         self.trailing_distance_atr = config.trailing_distance_atr
+        self.trailing_update_threshold_atr = config.trailing_update_threshold_atr
 
         # Partial Take Profit (implemented in Phase 1, R-multiple based)
         self.enable_partial_tp = config.enable_partial_tp
@@ -957,11 +959,23 @@ class DeepSeekAIStrategy(Strategy):
         # Store signal
         self.last_signal = signal_data
 
-        # Execute trade
-        try:
-            self._execute_trade(signal_data, price_data, technical_data, current_position)
-        except Exception as e:
-            self.log.error(f"❌ Trade execution failed: {e}", exc_info=True)
+        # The analysis ran for several seconds; the position may have changed in
+        # the meantime (e.g. an exchange-side stop filled). Never act on a stale
+        # snapshot: re-read the position and, if it differs from what the LLM
+        # was shown, skip execution for this cycle.
+        fresh_position = self._get_current_position_data()
+        if self._position_snapshot(fresh_position) != self._position_snapshot(current_position):
+            self.log.warning(
+                f"⚠️ Position changed during analysis "
+                f"({self._position_snapshot(current_position)} → {self._position_snapshot(fresh_position)}) "
+                f"- skipping execution this cycle"
+            )
+            self._log_signal_record(signal_data, price_data, technical_data, fresh_position)
+        else:
+            try:
+                self._execute_trade(signal_data, price_data, technical_data, fresh_position)
+            except Exception as e:
+                self.log.error(f"❌ Trade execution failed: {e}", exc_info=True)
 
         # Safety maintenance: cancel orphan reduce-only orders left behind when flat.
         if self.enable_oco:
@@ -990,6 +1004,13 @@ class DeepSeekAIStrategy(Strategy):
             "timestamp": self.clock.utc_now().strftime("%Y-%m-%d %H:%M:%S"),
             "forced": True,
         }
+
+    @staticmethod
+    def _position_snapshot(position: Optional[Dict[str, Any]]) -> str:
+        """Compact, comparable description of a position dict ('flat' when None)."""
+        if not position:
+            return "flat"
+        return f"{position.get('side', '?')} {float(position.get('quantity', 0.0)):.3f}"
 
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""
@@ -2228,8 +2249,12 @@ class DeepSeekAIStrategy(Strategy):
                     current_sl_price = state["current_sl_price"]
                     
                     # Only update if new SL is significantly higher than current
+                    # (ATR-based minimum step when trailing by ATR; the percentage
+                    # threshold is far too coarse relative to an ATR distance)
                     if current_sl_price is None:
                         should_update = True
+                    elif use_atr:
+                        should_update = (new_sl_price - current_sl_price) >= self.trailing_update_threshold_atr * atr
                     else:
                         price_move_pct = (new_sl_price - current_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
@@ -2273,6 +2298,8 @@ class DeepSeekAIStrategy(Strategy):
                     # Only update if new SL is significantly lower than current
                     if current_sl_price is None:
                         should_update = True
+                    elif use_atr:
+                        should_update = (current_sl_price - new_sl_price) >= self.trailing_update_threshold_atr * atr
                     else:
                         price_move_pct = (current_sl_price - new_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
