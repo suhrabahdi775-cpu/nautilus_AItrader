@@ -79,3 +79,24 @@ and sweeps any leftovers at startup / each cycle when flat.
 latency 6.7-9.7 s per cycle; sizing on $5,000 paper equity -> 0.118 BTC
 (capped at 2x equity notional); round-trip taker commission ~$8 on ~$9.9k
 notional.
+
+## One-week replay with real LLM decisions (`tools/replay_week.py`)
+
+```bash
+python tools/replay_week.py decide --days 7 --workers 4 --time-budget 150   # resumable; ~675 LLM calls
+python tools/replay_week.py simulate --equity 500 [--no-regime-filter] [--min-confidence LOW]
+```
+
+Feeds the last N days of real 15m klines through `TechnicalIndicatorManager`,
+asks the configured model for a signal at every bar close (same prompt as
+live, but shown no open position), then simulates the live execution rules
+(risk sizing, ATR SL/TP, partial TP, ATR trailing, regime filter, kill-switches,
+taker fees 0.05%/side, 0.02% slippage). Decisions are checkpointed in
+`logs/replay/decisions.jsonl`; results in `logs/replay/result_<equity>.json`.
+
+Result for 2026-10-15 → 2026-10-22 (claude-opus-5-5, effort medium, 675 decisions,
+0 fallbacks): 95% HOLD, 22 SELL / 9 BUY; with $500: 8 trades, 50% win rate,
+profit factor 0.90, net **-$1.66 (-0.33%)**, fees $7.49, max drawdown 2.6%
+(BTC +2.06% buy-and-hold). Without the regime filter: +$6.28 (+1.26%, 13
+trades, PF 1.25). Eight trades is far too small a sample to claim an edge
+either way; fees were the largest single line item.
