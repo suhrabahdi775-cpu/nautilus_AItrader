@@ -135,7 +135,10 @@ def make_strategy_stub(**attrs: Any):
             "paused_until": None,
             "day_date": None,
             "day_start_equity": None,
+            "equity_peak": None,
+            "halted_reason": None,
         },
+        "max_total_drawdown_pct": 0.10,
         "risk_state_file": "",
         "_save_risk_state": Mock(),  # no disk persistence in unit tests
         "llm": SimpleNamespace(signal_history=[], provider="test", model="stub"),

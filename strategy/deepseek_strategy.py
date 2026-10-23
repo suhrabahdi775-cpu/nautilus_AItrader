@@ -153,6 +153,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     daily_loss_limit_pct: float = 0.03  # Halt new trades for the day beyond this daily loss
     max_consecutive_losses: int = 5  # Pause trading after this many consecutive losing closes
     loss_pause_hours: float = 24.0  # Pause duration after kill-switch triggers
+    max_total_drawdown_pct: float = 0.10  # Circuit breaker: halt (until manual reset) once live equity is this far below its peak
     max_consecutive_same_signal: int = 5  # Block churn after this many identical consecutive signals
     disaster_stop_enabled: bool = True  # Native exchange-side catastrophic stop (survives restarts)
     disaster_stop_min_pct: float = 0.015  # Minimum distance of the disaster stop from entry
@@ -313,6 +314,7 @@ class DeepSeekAIStrategy(Strategy):
         self.daily_loss_limit_pct = config.daily_loss_limit_pct
         self.max_consecutive_losses = config.max_consecutive_losses
         self.loss_pause_hours = config.loss_pause_hours
+        self.max_total_drawdown_pct = config.max_total_drawdown_pct
         self.max_consecutive_same_signal = config.max_consecutive_same_signal
         self.disaster_stop_enabled = config.disaster_stop_enabled
         self.disaster_stop_min_pct = config.disaster_stop_min_pct
@@ -333,6 +335,8 @@ class DeepSeekAIStrategy(Strategy):
             "paused_until": None,      # ISO timestamp (UTC) while paused
             "day_date": None,          # UTC date of current daily baseline
             "day_start_equity": None,  # Equity at start of UTC day
+            "equity_peak": None,       # High-water mark of live equity (circuit breaker reference)
+            "halted_reason": None,     # Set when the circuit breaker trips; cleared only by a manual reset
         }
 
         # Native disaster-stop orders (exchange-side, survive process restarts)
@@ -1193,6 +1197,28 @@ class DeepSeekAIStrategy(Strategy):
             except Exception:
                 pass
 
+    def _trigger_halt(self, reason: str) -> None:
+        """
+        Circuit breaker: stop opening new positions until an operator resets the
+        risk state (delete logs/risk_state.json or start with RESET_RISK_STATE=true).
+        Open positions keep their exchange-side exits.
+        """
+        far_future = self.clock.utc_now().to_pydatetime() + timedelta(days=3650)
+        self.risk_state["paused_until"] = far_future.isoformat()
+        self.risk_state["halted_reason"] = reason
+        self._save_risk_state()
+        self.log.error(f"🛑 CIRCUIT BREAKER - TRADING HALTED: {reason} (manual reset required)")
+        if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
+            try:
+                alert = self.telegram_bot.format_error_alert({
+                    'level': 'HALT',
+                    'message': f"Circuit breaker - trading halted: {reason}"[:200],
+                    'context': 'risk_guard',
+                })
+                self.telegram_bot.send_message_sync(alert)
+            except Exception:
+                pass
+
     def _check_risk_guards(self) -> bool:
         """
         Evaluate kill-switches before any trade execution.
@@ -1236,6 +1262,25 @@ class DeepSeekAIStrategy(Strategy):
             except (ValueError, TypeError):
                 self.risk_state["paused_until"] = None
                 self._save_risk_state()
+
+        # (2b) Circuit breaker: total drawdown from the live-equity high-water mark.
+        # Unlike the daily/streak pauses this does NOT expire on its own.
+        if self.risk_state.get("halted_reason"):
+            self.log.warning(f"🛑 Trading halted by circuit breaker: {self.risk_state['halted_reason']}")
+            return False
+        if live_equity is not None and self.max_total_drawdown_pct > 0:
+            peak = self.risk_state.get("equity_peak")
+            if not peak or live_equity > peak:
+                self.risk_state["equity_peak"] = live_equity
+                self._save_risk_state()
+                peak = live_equity
+            drawdown = (peak - live_equity) / peak if peak else 0.0
+            if drawdown >= self.max_total_drawdown_pct:
+                self._trigger_halt(
+                    f"Equity ${live_equity:,.2f} is {drawdown:.1%} below peak ${peak:,.2f} "
+                    f"(limit {self.max_total_drawdown_pct:.0%})"
+                )
+                return False
 
         # (3) Daily loss limit: live equity vs live baseline only. Comparing a
         # fallback (configured) equity against a live baseline could trigger a

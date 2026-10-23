@@ -186,6 +186,46 @@ def test_active_pause_blocks_and_expired_pause_resets_streak():
     assert strategy.risk_state["consecutive_losses"] == 0
 
 
+def test_circuit_breaker_halts_on_total_drawdown_and_requires_manual_reset():
+    strategy = _guard_stub(_get_live_equity=lambda: 1000.0,
+                           risk_state={"consecutive_losses": 0, "paused_until": None, "day_date": "2026-10-20",
+                                       "day_start_equity": 1000.0, "equity_peak": None, "halted_reason": None})
+    assert strategy._check_risk_guards() is True
+    assert strategy.risk_state["equity_peak"] == 1000.0
+
+    strategy._get_live_equity = lambda: 1100.0  # new high-water mark
+    strategy.risk_state["day_start_equity"] = 1100.0
+    assert strategy._check_risk_guards() is True and strategy.risk_state["equity_peak"] == 1100.0
+
+    strategy._get_live_equity = lambda: 985.0  # -10.5% from peak -> halt (daily -10.5% would also pause, but halt wins)
+    strategy.risk_state["day_start_equity"] = 985.0
+    assert strategy._check_risk_guards() is False
+    assert "below peak" in strategy.risk_state["halted_reason"]
+    assert strategy.log.contains("CIRCUIT BREAKER")
+
+    strategy._get_live_equity = lambda: 1200.0  # recovery does NOT un-halt
+    strategy.risk_state["day_start_equity"] = 1200.0
+    assert strategy._check_risk_guards() is False
+
+    strategy.risk_state.update({"halted_reason": None, "paused_until": None})  # manual reset
+    assert strategy._check_risk_guards() is True
+
+
+def test_live_gate_requires_explicit_ack(monkeypatch):
+    import main_live
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("LIVE_TRADING_ACK", raising=False)
+    try:
+        main_live.get_strategy_config("live")
+        assert False, "live without ack must be refused"
+    except ValueError as e:
+        assert "LIVE_TRADING_ACK" in str(e)
+    monkeypatch.setenv("LIVE_TRADING_ACK", "true")
+    assert main_live.get_strategy_config("live").max_total_drawdown_pct == 0.10
+    monkeypatch.delenv("LIVE_TRADING_ACK")
+    main_live.get_strategy_config("testnet")  # paper venues need no ack
+
+
 def test_anti_churn_ignores_hold_runs_but_blocks_actionable_runs():
     strategy = _guard_stub(_get_live_equity=lambda: 10_000.0,
                            risk_state={"consecutive_losses": 0, "paused_until": None,
@@ -263,6 +303,8 @@ def test_binance_configs_carry_environment_and_rest_url(monkeypatch):
     monkeypatch.setenv("BINANCE_API_KEY", "k")
     monkeypatch.setenv("BINANCE_API_SECRET", "s")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("LIVE_TRADING_ACK", "true")  # the live config below needs the gate
+    monkeypatch.setattr(main_live, "query_binance_symbol_settings", lambda *a, **k: None)
     data_cfg, exec_cfg = main_live.get_binance_config("testnet")
     assert data_cfg.environment == BinanceEnvironment.TESTNET
     assert exec_cfg.environment == BinanceEnvironment.TESTNET

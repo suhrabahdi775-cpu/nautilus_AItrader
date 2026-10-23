@@ -206,6 +206,21 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         print(f"[CONFIG] 🧪 FORCE_SIGNAL={force_signal} (paper venue {binance_env}) - LLM bypassed for the first cycle(s)")
     print(f"[CONFIG] LLM provider: {llm['provider']} | model: {llm['model'] or '(provider default)'}")
 
+    # Live gate: a real account is never traded by accident (copied template, wrong
+    # BINANCE_ENV, ...). The operator must set LIVE_TRADING_ACK=true explicitly.
+    if binance_env == 'live' and not get_env_bool('LIVE_TRADING_ACK', False):
+        raise ValueError(
+            "BINANCE_ENV=live but LIVE_TRADING_ACK is not true. Run `python tools/preflight_live.py`, "
+            "read DEPLOY_LIVE.md, then set LIVE_TRADING_ACK=true in .env to trade a real account."
+        )
+
+    # Operator-requested reset of the persisted kill-switch state (after a circuit-breaker halt)
+    if get_env_bool('RESET_RISK_STATE', False):
+        risk_file = Path(get_env_str('RISK_STATE_FILE', 'logs/risk_state.json'))
+        if risk_file.exists():
+            risk_file.unlink()
+            print(f"[CONFIG] ⚠️ RESET_RISK_STATE=true -> removed {risk_file} (kill-switch state cleared)")
+
     # Safety: TEST_MODE / DRY_RUN run the full pipeline but never execute orders
     # (maps onto the strategy's signal-only shadow mode). Previously these flags
     # only printed a banner while real orders were still placed.
@@ -318,6 +333,8 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         daily_loss_limit_pct=get_env_float('DAILY_LOSS_LIMIT_PCT', '0.03'),
         max_consecutive_losses=get_env_int('MAX_CONSECUTIVE_LOSSES', '5'),
         loss_pause_hours=get_env_float('LOSS_PAUSE_HOURS', '24'),
+        max_total_drawdown_pct=get_env_float('MAX_TOTAL_DRAWDOWN_PCT', '0.10'),
+        risk_state_file=get_env_str('RISK_STATE_FILE', 'logs/risk_state.json'),
         max_consecutive_same_signal=get_env_int('MAX_CONSECUTIVE_SAME_SIGNAL', '5'),
 
         # Phase 1: ATR-based exits & trailing
