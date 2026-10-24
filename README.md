@@ -57,7 +57,7 @@ Haiku 5.5 ≈ $0.05/day.
 
 ## Going Live
 
-Read **[DEPLOY_LIVE.md](DEPLOY_LIVE.md)**. In short: VPS near Binance (`deploy/setup_vps.sh`),
+Read **[DEPLOY_LIVE.md](DEPLOY_LIVE.md)** (VPS + systemd) or **[deploy/DOKPLOY.md](deploy/DOKPLOY.md)** (Dokploy / Docker). In short: VPS near Binance (`deploy/setup_vps.sh`),
 live API key with futures-only permissions and IP restriction, `.env` from
 `.env.live.example` (half-risk first-month defaults), `python tools/preflight_live.py`
 must print **GO**, then `LIVE_TRADING_ACK=true` and `systemctl start nautilus-trader`.

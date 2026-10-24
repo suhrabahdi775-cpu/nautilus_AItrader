@@ -366,6 +366,7 @@ def get_strategy_config(binance_env: str = 'live') -> DeepSeekAIStrategyConfig:
         native_exits=get_env_bool('NATIVE_EXITS', True),      # exchange-side SL/TP that survive restarts
         llm_async=get_env_bool('LLM_ASYNC', True),            # LLM/sentiment/regime calls off the event loop
         position_state_file=get_env_str('POSITION_STATE_FILE', 'logs/position_state.json'),
+        heartbeat_file=get_env_str('HEARTBEAT_FILE', 'logs/heartbeat'),
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),

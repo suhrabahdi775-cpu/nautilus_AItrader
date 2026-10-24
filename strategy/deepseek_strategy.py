@@ -192,6 +192,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     native_exits: bool = True  # exchange-side SL (STOP_MARKET) + TP (TAKE_PROFIT_MARKET) that survive restarts;
                                # False = legacy emulated bracket legs (die with the process)
     position_state_file: str = "logs/position_state.json"  # persisted exit/trailing/partial-TP state
+    heartbeat_file: str = "logs/heartbeat"  # touched on every bar/cycle; container healthchecks read its age
     llm_async: bool = True  # run LLM + sentiment + regime network calls on a worker thread (keeps the event loop free)
 
 
@@ -323,6 +324,7 @@ class DeepSeekAIStrategy(Strategy):
         # Exit management & resilience
         self.native_exits = config.native_exits
         self.position_state_file = config.position_state_file
+        self.heartbeat_file = config.heartbeat_file
         self.llm_async = config.llm_async
         self._pending_entry: Optional[Dict[str, Any]] = None  # context for the fill that arms native exits
         self._loop = None  # asyncio loop captured in on_start (live mode)
@@ -558,6 +560,7 @@ class DeepSeekAIStrategy(Strategy):
         )
 
         self.log.info("Strategy started successfully")
+        self._touch_heartbeat("start")
 
         # Restore persisted kill-switch state (daily baseline, loss streaks, pauses)
         self._load_risk_state()
@@ -749,6 +752,7 @@ class DeepSeekAIStrategy(Strategy):
             The bar received
         """
         self.bars_received += 1
+        self._touch_heartbeat("bar")
 
         # Update technical indicators
         self.indicator_manager.update(bar)
@@ -775,6 +779,7 @@ class DeepSeekAIStrategy(Strategy):
         """
         self.log.info("=" * 60)
         self.log.info("Running periodic analysis...")
+        self._touch_heartbeat("timer")
 
         if self._analysis_inflight:
             self.log.warning("⏳ Previous analysis still in flight (slow LLM?) - skipping this cycle")
@@ -1153,13 +1158,31 @@ class DeepSeekAIStrategy(Strategy):
                 break
         return run
 
+    def _state_venue_tag(self) -> str:
+        """Identifies the venue a persisted state file belongs to (REST base = live/testnet/demo)."""
+        return self.binance_rest_base_url
+
     def _load_risk_state(self) -> None:
-        """Load persisted kill-switch state (survives restarts)."""
+        """
+        Load persisted kill-switch state (survives restarts).
+
+        State written on another venue (e.g. a testnet rehearsal before going
+        live) is discarded: its equity peak / baselines would be meaningless
+        here and could trip the circuit breaker immediately.
+        """
         try:
             if os.path.exists(self.risk_state_file):
                 with open(self.risk_state_file, 'r') as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
+                    saved_venue = saved.get("venue")
+                    if saved_venue and saved_venue != self._state_venue_tag():
+                        self.log.warning(
+                            f"⚠️ Risk state file belongs to another venue ({saved_venue}); "
+                            f"starting with fresh kill-switch state for {self._state_venue_tag()}"
+                        )
+                        self._save_risk_state()
+                        return
                     for key in self.risk_state:
                         if key in saved:
                             self.risk_state[key] = saved[key]
@@ -1174,7 +1197,7 @@ class DeepSeekAIStrategy(Strategy):
             if directory:
                 os.makedirs(directory, exist_ok=True)
             with open(self.risk_state_file, 'w') as f:
-                json.dump(self.risk_state, f)
+                json.dump({**self.risk_state, "venue": self._state_venue_tag()}, f)
         except Exception as e:
             self.log.warning(f"⚠️ Could not save risk state file: {e}")
 
@@ -2717,6 +2740,19 @@ class DeepSeekAIStrategy(Strategy):
                 except Exception as e:
                     self.log.warning(f"⚠️ Failed to cancel {label}: {e}")
 
+    def _touch_heartbeat(self, source: str) -> None:
+        """Write a liveness marker (ISO time + source). Read by tools/healthcheck.py."""
+        if not self.heartbeat_file:
+            return
+        try:
+            directory = os.path.dirname(self.heartbeat_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self.heartbeat_file, 'w') as f:
+                f.write(f"{self.clock.utc_now().isoformat()} {source}\n")
+        except Exception:
+            pass
+
     def _save_position_state(self) -> None:
         """Persist exit/trailing/partial-TP bookkeeping so a restart can re-adopt the position."""
         if not self.position_state_file:
@@ -2727,6 +2763,7 @@ class DeepSeekAIStrategy(Strategy):
                 os.makedirs(directory, exist_ok=True)
             payload = {
                 "instrument_id": str(self.instrument_id),
+                "venue": self._state_venue_tag(),
                 "saved_at": self.clock.utc_now().isoformat(),
                 "trailing_stop_state": self.trailing_stop_state,
                 "partial_tp_state": self.partial_tp_state,
@@ -2745,7 +2782,14 @@ class DeepSeekAIStrategy(Strategy):
         try:
             with open(self.position_state_file, 'r') as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                return None
+            if data.get("venue") and data["venue"] != self._state_venue_tag():
+                self.log.warning(
+                    f"⚠️ Position state file belongs to another venue ({data['venue']}) - ignoring it"
+                )
+                return None
+            return data
         except Exception as e:
             self.log.warning(f"⚠️ Could not load position state: {e}")
             return None

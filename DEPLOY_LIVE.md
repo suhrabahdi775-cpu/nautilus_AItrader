@@ -11,6 +11,8 @@ an order until `systemctl start`.
 > only money you can lose in full, and keep the first-month risk settings in
 > `.env.live.example`.
 
+> Running Dokploy or plain Docker? Use **[deploy/DOKPLOY.md](deploy/DOKPLOY.md)** instead of sections 1 and 5–6; everything else here still applies.
+
 ## 0. What you need
 - A Linux VPS near Binance's matching engine (AWS **ap-northeast-1 Tokyo** or
   **ap-southeast-1 Singapore**; 1 vCPU / 2 GB RAM is plenty). A laptop is not

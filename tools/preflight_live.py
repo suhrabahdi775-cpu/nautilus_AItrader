@@ -64,12 +64,17 @@ def main() -> int:
 
     # ------------------------------------------------------------- config sanity
     binance_env = env("BINANCE_ENV", "live").lower()
-    if binance_env == "live":
-        record("PASS", "BINANCE_ENV", "live")
+    is_live = binance_env == "live"
+    if is_live:
+        record("PASS", "BINANCE_ENV", "live - REAL MONEY")
+    elif binance_env in ("testnet", "demo"):
+        record("WARN", "BINANCE_ENV", f"{binance_env} - paper venue, not real trading (set BINANCE_ENV=live + live keys to go live)")
     else:
-        record("FAIL", "BINANCE_ENV", f"{binance_env!r} - set BINANCE_ENV=live (and LIVE keys) for real trading")
+        record("FAIL", "BINANCE_ENV", f"{binance_env!r} is not live|testnet|demo")
 
-    if env_bool("LIVE_TRADING_ACK"):
+    if not is_live:
+        record("PASS", "LIVE_TRADING_ACK", "not required on a paper venue")
+    elif env_bool("LIVE_TRADING_ACK"):
         record("PASS", "LIVE_TRADING_ACK", "true")
     else:
         record("FAIL", "LIVE_TRADING_ACK", "must be true to start on a live account (set it only after this preflight passes)")
@@ -106,8 +111,12 @@ def main() -> int:
     if env_path.exists():
         mode = stat.S_IMODE(env_path.stat().st_mode)
         record("PASS" if mode & 0o077 == 0 else "WARN", ".env permissions", f"{oct(mode)}" + ("" if mode & 0o077 == 0 else " -> chmod 600 .env"))
+    elif env("BINANCE_API_KEY"):
+        record("PASS", ".env", "not used - configuration injected via environment variables (container)")
     else:
-        record("FAIL", ".env", "missing")
+        record("FAIL", ".env", "missing and no environment variables set")
+    hb = ROOT / env("HEARTBEAT_FILE", "logs/heartbeat")
+    record("PASS", "heartbeat file", f"{hb} (healthcheck: tools/healthcheck.py)")
     for f in ("logs/position_state.json",):
         record("WARN" if (ROOT / f).exists() else "PASS", f, "exists - stale state from a previous run will be reconciled on start" if (ROOT / f).exists() else "clean")
     rs = ROOT / "logs" / "risk_state.json"

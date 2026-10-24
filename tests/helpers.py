@@ -145,6 +145,7 @@ def make_strategy_stub(**attrs: Any):
         # Exit management & resilience
         "native_exits": True,
         "position_state_file": "",
+        "heartbeat_file": "",
         "_save_position_state": Mock(),
         "_clear_position_state": Mock(),
         "_load_position_state": Mock(return_value=None),

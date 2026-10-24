@@ -380,3 +380,31 @@ def test_binance_exec_config_pins_leverage_and_margin(monkeypatch):
     _, exec_cfg = main_live.get_binance_config("live")
     assert exec_cfg.futures_leverages == {sym: 10}
     assert exec_cfg.futures_margin_types == {sym: BinanceFuturesMarginType.CROSS}
+
+
+def test_persisted_state_from_another_venue_is_discarded(tmp_path):
+    import json
+    rs = tmp_path / "risk_state.json"
+    rs.write_text(json.dumps({"consecutive_losses": 4, "paused_until": None, "day_date": "2026-10-23",
+                              "day_start_equity": 4955.0, "equity_peak": 4955.0, "halted_reason": None,
+                              "venue": "https://testnet.binancefuture.com"}))
+    strategy = make_strategy_stub(risk_state_file=str(rs), binance_rest_base_url="https://fapi.binance.com")
+    from strategy.deepseek_strategy import DeepSeekAIStrategy
+    strategy._save_risk_state = DeepSeekAIStrategy._save_risk_state.__get__(strategy)  # real writer for this test
+    strategy._load_risk_state()
+    assert strategy.risk_state["equity_peak"] is None and strategy.risk_state["consecutive_losses"] == 0
+    assert strategy.log.contains("another venue")
+    assert json.loads(rs.read_text())["venue"] == "https://fapi.binance.com"  # rewritten for the live venue
+
+    # same venue -> loaded
+    rs.write_text(json.dumps({"consecutive_losses": 2, "paused_until": None, "day_date": "2026-10-23",
+                              "day_start_equity": 500.0, "equity_peak": 520.0, "halted_reason": None,
+                              "venue": "https://fapi.binance.com"}))
+    strategy._load_risk_state()
+    assert strategy.risk_state["equity_peak"] == 520.0 and strategy.risk_state["consecutive_losses"] == 2
+
+    ps = tmp_path / "position_state.json"
+    ps.write_text(json.dumps({"venue": "https://testnet.binancefuture.com", "trailing_stop_state": {"x": 1}}))
+    strategy.position_state_file = str(ps)
+    strategy._load_position_state = DeepSeekAIStrategy._load_position_state.__get__(strategy)
+    assert strategy._load_position_state() is None
