@@ -193,22 +193,50 @@ def main() -> int:
             else:
                 record("WARN", "key restrictions", f"could not read apiRestrictions: {sc} {restr}")
 
-    # ------------------------------------------------------------- Anthropic
+    # ------------------------------------------------------------- LLM provider (the one actually configured)
     try:
         import main_live
         cfg = main_live.resolve_llm_settings(main_live.load_yaml_config().get("strategy", {}))
-        record("PASS", "LLM config", f"{cfg['provider']} / {cfg['model'] or '(default)'} effort={cfg['effort']} timeout={cfg['timeout_sec']}s")
+        record("PASS", "LLM config", f"{cfg['provider']} / {cfg['model'] or '(default)'} "
+               + (f"effort={cfg['effort']}" if cfg["provider"] == "anthropic" else f"temperature={cfg['temperature']} base_url={cfg['base_url'] or 'https://api.deepseek.com'}")
+               + f" timeout={cfg['timeout_sec']}s")
         if cfg["provider"] == "anthropic":
             import anthropic
             kw = {"api_key": cfg["api_key"], "timeout": 20}
             if cfg.get("workspace_id"):
                 kw["default_headers"] = {"anthropic-workspace-id": cfg["workspace_id"]}
-            client = anthropic.Anthropic(**kw)
-            ids = [m.id for m in client.models.list().data]
-            model = cfg["model"] or "claude-sonnet-5-5"
-            record("PASS" if model in ids else "FAIL", "Anthropic key", f"models visible: {len(ids)}; {model} {'available' if model in ids else 'NOT available'}")
+            try:
+                ids = [m.id for m in anthropic.Anthropic(**kw).models.list().data]
+                model = cfg["model"] or "claude-sonnet-5-5"
+                record("PASS" if model in ids else "FAIL", "Anthropic API",
+                       f"models visible: {len(ids)}; {model} {'available' if model in ids else 'NOT available'}")
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if "Request not allowed" in msg or "forbidden" in msg.lower():
+                    record("FAIL", "Anthropic API",
+                           "403 'Request not allowed' - this server's region is not supported by Anthropic "
+                           "(anthropic.com/supported-countries). Use LLM_PROVIDER=openai with a provider that serves "
+                           "this region, or host where the service is offered. Do NOT proxy/VPN - it violates the usage policy.")
+                else:
+                    record("FAIL", "Anthropic API", msg[:160])
+        else:
+            # OpenAI-compatible provider (DeepSeek, Kimi/Moonshot, ...): list models with the configured key
+            base = (cfg["base_url"] or "https://api.deepseek.com").rstrip("/")
+            model = cfg["model"] or "deepseek-v4-pro"
+            try:
+                r = requests.get(f"{base}/models", headers={"Authorization": f"Bearer {cfg['api_key']}"}, timeout=20)
+                if r.status_code == 200:
+                    ids = [m.get("id") for m in r.json().get("data", [])]
+                    record("PASS" if (not ids or model in ids) else "WARN", f"{cfg['provider']} API ({base})",
+                           f"reachable, auth OK; models: {len(ids)}; {model} {'listed' if model in ids else 'not in list (provider may still accept it)'}")
+                elif r.status_code in (401, 403):
+                    record("FAIL", f"{cfg['provider']} API ({base})", f"HTTP {r.status_code}: key rejected ({r.text[:100]})")
+                else:
+                    record("WARN", f"{cfg['provider']} API ({base})", f"HTTP {r.status_code}: {r.text[:100]}")
+            except Exception as e:  # noqa: BLE001
+                record("FAIL", f"{cfg['provider']} API ({base})", f"unreachable: {str(e)[:120]}")
     except Exception as e:  # noqa: BLE001
-        record("FAIL", "Anthropic key", str(e)[:160])
+        record("FAIL", "LLM config", str(e)[:160])
 
     # ------------------------------------------------------------- Telegram
     if env_bool("ENABLE_TELEGRAM"):

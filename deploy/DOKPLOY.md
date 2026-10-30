@@ -43,12 +43,19 @@ BINANCE_LEVERAGE=5
 BINANCE_MARGIN_TYPE=isolated
 LIVE_TRADING_ACK=false
 
-# --- AI ---
+# --- AI (A: Claude; B: an OpenAI-compatible provider that serves your region,
+#         e.g. DeepSeek - Anthropic returns 403 "Request not allowed" from unsupported countries) ---
 LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=
 ANTHROPIC_WORKSPACE_ID=
 LLM_MODEL=claude-opus-5-5
 LLM_EFFORT=medium
+# B) instead of the four lines above:
+# LLM_PROVIDER=openai
+# LLM_API_KEY=<deepseek key>
+# LLM_MODEL=deepseek-v4-pro
+# LLM_BASE_URL=https://api.deepseek.com
+# LLM_TEMPERATURE=0.1
 LLM_TIMEOUT_SEC=60
 LLM_MAX_TOKENS=1024
 LLM_ASYNC=true
